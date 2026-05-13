@@ -1,0 +1,9 @@
+# Cursor Rules for OpenDDIL Logistics Fusion Service
+
+- **Context**: Per-asset logistics fusion Restate Virtual Object (`AssetLogistics`). Phase 3.5.
+- **Boundary discipline** (ADR-0006): `src/fusion/rules.py` and `src/fusion/thresholds.py` are pure Python. No Faust/Kafka/Restate imports. Plumbing lives in `src/workflows/asset_logistics.py` and `src/main.py`.
+- **Vocabulary**: Internal severity is `LogisticsSeverity_{OK,DEGRADED,CRITICAL,NON_OPERATIONAL}` (stable). Customer labels (FMC/PMC/NMC, green/amber/red) live in the egress Bloblang ONLY. Never bake customer vocabulary into rules.py.
+- **Ontology dependencies**: `platform_reference.yaml` lives in `openddil-contracts/ontology/` (NOT here). Fuel% conversion requires this file. Unknown variant → `_eval_fuel` returns None — don't fabricate.
+- **Shared bootstrap**: `bootstrap/register_subscriptions.py` is a thin wrapper around `openddil_bootstrap.restate_subscriptions`.
+- **Restate durability**: State survives Kafka topic purges. Clear with `restate state clear "AssetLogistics/<asset_id>"` when tests need fresh state.
+- **Docker Compose**: Base `openddil-demo/docker-compose.yml` references `image: ghcr.io/edgy-solutions/openddil/logistics-fusion-service:latest` for both the service AND its bootstrap container. NEVER add `build:` to the base compose. Publish a new image when the Dockerfile changes.

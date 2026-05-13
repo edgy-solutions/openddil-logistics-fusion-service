@@ -1,0 +1,51 @@
+# OpenDDIL Logistics Fusion Service — LLM Context
+
+This repository (`openddil-logistics-fusion-service`) houses the per-asset
+logistics fusion Restate Virtual Object for OpenDDIL Phase 3.5.
+
+## Purpose
+
+One durable `AssetLogistics` Virtual Object instance per `asset_id`.
+Consumes:
+- `asset-telemetry-windows` (windowed slopes from Faust edge agent)
+- `asset-cm-state` (CM state from cm-service)
+- `raw-sensor-stream` (Silver telemetry, filtered to sustainment-carrying feeds)
+
+Emits `AssetLogisticsStatusUpdate` to compacted `asset-logistics-status`.
+
+## Key Files
+
+- `src/workflows/asset_logistics.py` — Restate Virtual Object.
+  4 handlers: `on_telemetry_window`, `on_cm_state_change`,
+  `on_proprietary_update`, `on_timer`.
+- `src/fusion/rules.py` — pure-Python `compute_logistics_status`.
+  7 evaluators: fuel, ammo, wear, mtbf, subsystems, cm_state, staleness.
+  No Faust/Restate/Kafka imports.
+- `src/fusion/thresholds.py` — env-driven `Thresholds` dataclass.
+- `src/fusion/ontology_check.py` — startup WARN for ontology drift
+  between alias files and `platform_reference.yaml`.
+- `src/main.py` — hypercorn ASGI server.
+- `bootstrap/register_subscriptions.py` — thin wrapper around shared
+  `openddil_bootstrap.restate_subscriptions` library.
+
+## Rules
+
+- Persistence/Computation separation (ADR-0006): rules.py is pure
+  Python; Faust/Restate/Kafka stay outside.
+- Internal severity vocabulary (`LogisticsSeverity_*`) is STABLE.
+  Customer-facing labels (FMC/PMC/NMC, green/amber/red) live in the
+  egress Bloblang only.
+- Fuel% requires platform capacity from `platform_reference.yaml`.
+  Unknown variant → return None, don't fabricate.
+- Restate state survives Kafka topic purges. Test fixtures use
+  `restate state clear "AssetLogistics/<asset_id>"` for fresh state.
+
+## Docker Compose
+
+When consumed by openddil-demo:
+- Base `docker-compose.yml` references
+  `image: ghcr.io/edgy-solutions/openddil/logistics-fusion-service:latest` for both
+  the service and its bootstrap container.
+- `docker-compose.override.yml` has the `build:` block + source mounts
+  for development.
+- NEVER add a `build:` to the base compose. Publish a new image first.

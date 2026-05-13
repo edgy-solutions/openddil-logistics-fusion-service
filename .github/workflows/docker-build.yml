@@ -1,0 +1,42 @@
+name: Docker Build
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+permissions:
+  contents: read
+  packages: write
+
+# Publishes ghcr.io/edgy-solutions/openddil/logistics-fusion-service:latest,
+# referenced by openddil-demo/docker-compose.yml for BOTH the fusion service
+# container and the logistics-fusion-bootstrap one-shot (same image, different
+# entrypoint). `${{ github.repository_owner }}` resolves to `edgy-solutions`
+# once the repo is hosted under that org.
+
+jobs:
+  build-logistics-fusion-service:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build logistics-fusion-service
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/openddil/logistics-fusion-service:latest

@@ -1,0 +1,687 @@
+"""Unit tests for the pure-Python fusion rules.
+
+These tests are framework-free: no Faust, no Restate, no Kafka. They
+construct Protobuf inputs in-memory, call `compute_logistics_status`, and
+assert on the returned AssetLogisticsStatus.
+
+Target: ≥90% coverage on fusion/rules.py.
+"""
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from openddil.common.v1 import quantity_pb2 as qpb
+from openddil.logistics.v1 import logistics_status_pb2 as ls
+from openddil.telemetry.v1 import telemetry_pb2 as tel
+from openddil.logistics.v1 import windowed_telemetry_pb2 as win
+from openddil.configuration.v1 import as_maintained_pb2 as cm
+
+from fusion.rules import (
+    FusionInputs,
+    compute_logistics_status,
+    _eval_fuel,
+    _eval_ammo,
+    _eval_wear,
+    _eval_mtbf,
+    _eval_subsystems,
+    _eval_cm_state,
+    _eval_staleness,
+)
+from fusion.thresholds import Thresholds
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+ASSET_ID = "USA-ARMY-1HBCT-M1A2-4773"
+VARIANT = "M1A2-SEPv3"
+
+
+def _thr(**overrides) -> Thresholds:
+    base = Thresholds.from_env()
+    # Build a fresh frozen instance with any overrides applied.
+    fields = {
+        "fuel_pct_critical":    base.fuel_pct_critical,
+        "fuel_pct_degraded":    base.fuel_pct_degraded,
+        "ammo_pct_critical":    base.ammo_pct_critical,
+        "ammo_pct_degraded":    base.ammo_pct_degraded,
+        "wear_pct_critical":    base.wear_pct_critical,
+        "wear_pct_degraded":    base.wear_pct_degraded,
+        "mtbf_hours_critical":  base.mtbf_hours_critical,
+        "mtbf_hours_degraded":  base.mtbf_hours_degraded,
+        "emit_interval_seconds": base.emit_interval_seconds,
+        "stale_input_seconds":  base.stale_input_seconds,
+        "subsystem_health_map": dict(base.subsystem_health_map),
+    }
+    fields.update(overrides)
+    return Thresholds(**fields)
+
+
+def _now_ns() -> int:
+    return int(time.time() * 1_000_000_000)
+
+
+def _telemetry(
+    *,
+    fuel_value: float | None = None,
+    fuel_unit: str = "%",
+    consumables: dict[str, tuple[int, int]] | None = None,
+    wear: dict[str, tuple[float, float]] | None = None,
+    faults: list[str] | None = None,
+    sample_time_ns: int | None = None,
+) -> tel.EntityTelemetryEvent:
+    evt = tel.EntityTelemetryEvent()
+    evt.asset.asset_id = ASSET_ID
+    evt.asset.platform_variant = VARIANT
+
+    if fuel_value is not None:
+        evt.sustainment.fluids.fuel_remaining.value = fuel_value
+        evt.sustainment.fluids.fuel_remaining.unit = fuel_unit
+
+    if consumables:
+        for slot, (remaining, capacity) in consumables.items():
+            cs = evt.sustainment.consumables.items[slot]
+            cs.quantity_remaining = remaining
+            cs.quantity_capacity = capacity
+
+    if wear:
+        for comp, (hours_in_service, rul) in wear.items():
+            ws = evt.sustainment.wear.components[comp]
+            ws.hours_in_service.value = hours_in_service
+            ws.hours_in_service.unit = "h"
+            ws.remaining_useful_life.value = rul
+            ws.remaining_useful_life.unit = "h"
+
+    if faults:
+        evt.sustainment.health.active_fault_codes.extend(faults)
+
+    if sample_time_ns is not None:
+        evt.provenance.sample_time.FromNanoseconds(sample_time_ns)
+    return evt
+
+
+def _cm_state(*, status_name: str | None) -> cm.AsMaintainedConfiguration:
+    state = cm.AsMaintainedConfiguration()
+    state.asset_id = ASSET_ID
+    state.baseline_id = "M1A2-SEPv3-Baseline-2024.2"
+    if status_name is not None:
+        state.overall_status = cm.ConfigurationStatus.Value(status_name)
+    return state
+
+
+def _windows(
+    *,
+    wear_trends: list[tuple[str, float, float]] | None = None,
+) -> win.WindowedTelemetry:
+    """wear_trends: [(component, latest_rul_h, slope_h_per_h), ...]"""
+    w = win.WindowedTelemetry()
+    w.asset_id = ASSET_ID
+    w.platform_variant = VARIANT
+    if wear_trends:
+        for comp, latest_h, slope in wear_trends:
+            t = w.wear_trends.add()
+            t.component_key = comp
+            t.remaining_useful_life.latest.value = latest_h
+            t.remaining_useful_life.latest.unit = "h"
+            t.remaining_useful_life.slope.value = slope
+            t.remaining_useful_life.slope.unit = "h/h"
+    return w
+
+
+# ---------------------------------------------------------------------------
+# Healthy case
+# ---------------------------------------------------------------------------
+def test_healthy_asset_is_ok_with_no_factors():
+    inputs = FusionInputs(
+        asset_id=ASSET_ID,
+        platform_variant=VARIANT,
+        latest_telemetry=_telemetry(
+            fuel_value=85.0,
+            consumables={"main_gun": (40, 40)},
+            wear={"engine": (200.0, 1800.0)},  # 10% wear
+            sample_time_ns=_now_ns() - 30_000_000_000,  # 30s ago, not stale
+        ),
+        telemetry_windows=_windows(),
+        cm_state=_cm_state(status_name="CONFIG_STATUS_IN_COMPLIANCE"),
+    )
+    status = compute_logistics_status(inputs, _thr(), _now_ns())
+    assert status.overall_severity == ls.LOGISTICS_SEVERITY_OK
+    assert len(status.constraining_factors) == 0
+    assert status.asset_id == ASSET_ID
+    assert status.platform_variant == VARIANT
+    assert status.cm_baseline_id == "M1A2-SEPv3-Baseline-2024.2"
+
+
+# ---------------------------------------------------------------------------
+# Fuel evaluator
+# ---------------------------------------------------------------------------
+def test_fuel_degraded_pct():
+    factor = _eval_fuel(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(fuel_value=25.0, fuel_unit="%"),
+                      None, None),
+        _thr(),
+    )
+    assert factor is not None
+    assert factor.severity == ls.LOGISTICS_SEVERITY_DEGRADED
+    assert factor.current_value.unit == "%"
+    assert factor.current_value.value == pytest.approx(25.0)
+
+
+def test_fuel_critical_pct():
+    factor = _eval_fuel(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(fuel_value=12.0, fuel_unit="%"),
+                      None, None),
+        _thr(),
+    )
+    assert factor is not None
+    assert factor.severity == ls.LOGISTICS_SEVERITY_CRITICAL
+
+
+def test_fuel_above_threshold_returns_none():
+    factor = _eval_fuel(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(fuel_value=80.0, fuel_unit="%"),
+                      None, None),
+        _thr(),
+    )
+    assert factor is None
+
+
+def test_fuel_volume_converts_via_pint_then_pct():
+    """504 gal capacity, 100 gal remaining ≈ 19.8% → CRITICAL band."""
+    factor = _eval_fuel(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(fuel_value=100.0, fuel_unit="gal_us"),
+                      None, None),
+        _thr(),
+    )
+    assert factor is not None
+    # 100 gal / 504.4 gal = 19.83% — between critical (15) and degraded (30)
+    assert factor.severity == ls.LOGISTICS_SEVERITY_DEGRADED
+
+
+def test_fuel_unit_mismatch_liters_vs_gallons():
+    """Same physical 100 gal expressed as ~378.5 L should compute the same %."""
+    # 100 gal_us ≈ 378.541 L. With 504.4 gal capacity in the env table,
+    # pint converts L → gal correctly.
+    factor = _eval_fuel(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(fuel_value=378.541, fuel_unit="L"),
+                      None, None),
+        _thr(),
+    )
+    assert factor is not None
+    # Should land in the same band as the gallons-input test.
+    assert factor.severity == ls.LOGISTICS_SEVERITY_DEGRADED
+
+
+def test_fuel_unknown_variant_skips():
+    factor = _eval_fuel(
+        FusionInputs(ASSET_ID, "UNOBTAINIUM-99",
+                      _telemetry(fuel_value=100.0, fuel_unit="gal_us"),
+                      None, None),
+        _thr(),
+    )
+    assert factor is None
+
+
+def test_fuel_no_telemetry_skips():
+    assert _eval_fuel(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None),
+        _thr(),
+    ) is None
+
+
+def test_fuel_unset_field_skips():
+    factor = _eval_fuel(
+        FusionInputs(ASSET_ID, VARIANT, _telemetry(), None, None),
+        _thr(),
+    )
+    assert factor is None
+
+
+# ---------------------------------------------------------------------------
+# Ammunition evaluator
+# ---------------------------------------------------------------------------
+def test_ammo_critical_when_one_slot_low():
+    factors = _eval_ammo(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(consumables={
+                          "main_gun": (3, 40),   # 7.5% → CRITICAL
+                          "coax":     (1800, 2000),  # 90% → fine
+                      }), None, None),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].factor_id == "ammo.main_gun"
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_CRITICAL
+
+
+def test_ammo_multiple_below_threshold():
+    factors = _eval_ammo(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(consumables={
+                          "main_gun": (8, 40),     # 20% → DEGRADED
+                          "smoke":    (1, 8),      # 12.5% → DEGRADED
+                      }), None, None),
+        _thr(),
+    )
+    assert len(factors) == 2
+    assert all(f.severity == ls.LOGISTICS_SEVERITY_DEGRADED for f in factors)
+
+
+def test_ammo_zero_capacity_skips():
+    factors = _eval_ammo(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(consumables={"weird_slot": (0, 0)}),
+                      None, None),
+        _thr(),
+    )
+    assert factors == []
+
+
+# ---------------------------------------------------------------------------
+# Wear evaluator
+# ---------------------------------------------------------------------------
+def test_wear_critical():
+    factors = _eval_wear(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(wear={"transmission": (950.0, 50.0)}),
+                      None, None),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_CRITICAL
+    assert factors[0].factor_id == "wear.transmission"
+
+
+def test_wear_degraded():
+    factors = _eval_wear(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(wear={"engine": (800.0, 200.0)}),  # 80%
+                      None, None),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_DEGRADED
+
+
+def test_wear_unset_quantities_skip():
+    factors = _eval_wear(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(wear={"phantom": (0.0, 0.0)}),
+                      None, None),
+        _thr(),
+    )
+    assert factors == []
+
+
+# ---------------------------------------------------------------------------
+# MTBF evaluator
+# ---------------------------------------------------------------------------
+def test_mtbf_critical_from_negative_slope():
+    """RUL dropping at -10 h/h, latest 5 h → 0.5 h to failure (critical)."""
+    factor = _eval_mtbf(
+        FusionInputs(ASSET_ID, VARIANT, None,
+                      _windows(wear_trends=[("transmission", 5.0, -10.0)]),
+                      None),
+        _thr(),
+    )
+    assert factor is not None
+    assert factor.severity == ls.LOGISTICS_SEVERITY_CRITICAL
+    assert factor.factor_id == "mtbf.transmission"
+
+
+def test_mtbf_degraded_from_slow_decline():
+    """RUL dropping at -1 h/h, latest 6 h → 6 h to failure (degraded)."""
+    factor = _eval_mtbf(
+        FusionInputs(ASSET_ID, VARIANT, None,
+                      _windows(wear_trends=[("engine", 6.0, -1.0)]),
+                      None),
+        _thr(),
+    )
+    assert factor is not None
+    assert factor.severity == ls.LOGISTICS_SEVERITY_DEGRADED
+
+
+def test_mtbf_positive_slope_skips():
+    factor = _eval_mtbf(
+        FusionInputs(ASSET_ID, VARIANT, None,
+                      _windows(wear_trends=[("battery", 100.0, 0.5)]),
+                      None),
+        _thr(),
+    )
+    assert factor is None
+
+
+def test_mtbf_no_windows_skips():
+    assert _eval_mtbf(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None), _thr(),
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Subsystem health evaluator
+# ---------------------------------------------------------------------------
+def test_subsystem_inoperative_non_operational():
+    factors = _eval_subsystems(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(faults=["POWERPLANT:INOPERATIVE"]),
+                      None, None),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_NON_OPERATIONAL
+
+
+def test_subsystem_degraded():
+    factors = _eval_subsystems(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(faults=["TRANSMISSION:DEGRADED"]),
+                      None, None),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_DEGRADED
+
+
+def test_subsystem_unknown_health_skipped():
+    factors = _eval_subsystems(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(faults=["WEIRD:PARTIALLY-MAGICAL"]),
+                      None, None),
+        _thr(),
+    )
+    assert factors == []
+
+
+def test_subsystem_token_without_colon_handled():
+    factors = _eval_subsystems(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(faults=["INOPERATIVE"]),
+                      None, None),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].factor_id == "subsystem.unknown"
+
+
+# ---------------------------------------------------------------------------
+# CM state evaluator
+# ---------------------------------------------------------------------------
+def test_cm_not_mission_capable_is_non_operational():
+    factor = _eval_cm_state(
+        FusionInputs(ASSET_ID, VARIANT, None, None,
+                      _cm_state(status_name="CONFIG_STATUS_NOT_MISSION_CAPABLE")),
+        _thr(),
+    )
+    assert factor is not None
+    assert factor.severity == ls.LOGISTICS_SEVERITY_NON_OPERATIONAL
+
+
+def test_cm_major_discrepancy_is_degraded():
+    factor = _eval_cm_state(
+        FusionInputs(ASSET_ID, VARIANT, None, None,
+                      _cm_state(status_name="CONFIG_STATUS_MAJOR_DISCREPANCY")),
+        _thr(),
+    )
+    assert factor is not None
+    assert factor.severity == ls.LOGISTICS_SEVERITY_DEGRADED
+
+
+def test_cm_in_compliance_no_factor():
+    factor = _eval_cm_state(
+        FusionInputs(ASSET_ID, VARIANT, None, None,
+                      _cm_state(status_name="CONFIG_STATUS_IN_COMPLIANCE")),
+        _thr(),
+    )
+    assert factor is None
+
+
+def test_cm_no_state_skips():
+    assert _eval_cm_state(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None), _thr(),
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Staleness
+# ---------------------------------------------------------------------------
+def test_no_telemetry_is_degraded_staleness():
+    factor = _eval_staleness(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None),
+        _thr(), _now_ns(),
+    )
+    assert factor is not None
+    assert factor.severity == ls.LOGISTICS_SEVERITY_DEGRADED
+    assert factor.factor_id == "stale_inputs"
+
+
+def test_old_telemetry_is_stale():
+    now = _now_ns()
+    factor = _eval_staleness(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(sample_time_ns=now - 600_000_000_000),  # 10 min
+                      None, None),
+        _thr(), now,
+    )
+    assert factor is not None
+    assert factor.severity == ls.LOGISTICS_SEVERITY_DEGRADED
+
+
+def test_fresh_telemetry_not_stale():
+    now = _now_ns()
+    factor = _eval_staleness(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(sample_time_ns=now - 10_000_000_000),  # 10 s
+                      None, None),
+        _thr(), now,
+    )
+    assert factor is None
+
+
+def test_telemetry_without_sample_time_no_staleness_factor():
+    factor = _eval_staleness(
+        FusionInputs(ASSET_ID, VARIANT, _telemetry(), None, None),
+        _thr(), _now_ns(),
+    )
+    assert factor is None
+
+
+# ---------------------------------------------------------------------------
+# Composition — overall severity is max across factors
+# ---------------------------------------------------------------------------
+def test_multiple_amber_factors_overall_degraded():
+    inputs = FusionInputs(
+        asset_id=ASSET_ID,
+        platform_variant=VARIANT,
+        latest_telemetry=_telemetry(
+            fuel_value=25.0,
+            consumables={"main_gun": (8, 40)},  # 20% — DEGRADED
+            sample_time_ns=_now_ns(),
+        ),
+        telemetry_windows=_windows(),
+        cm_state=_cm_state(status_name="CONFIG_STATUS_IN_COMPLIANCE"),
+    )
+    status = compute_logistics_status(inputs, _thr(), _now_ns())
+    assert status.overall_severity == ls.LOGISTICS_SEVERITY_DEGRADED
+    assert len(status.constraining_factors) >= 2
+
+
+def test_one_red_among_ambers_overall_critical():
+    inputs = FusionInputs(
+        asset_id=ASSET_ID,
+        platform_variant=VARIANT,
+        latest_telemetry=_telemetry(
+            fuel_value=25.0,                       # DEGRADED
+            consumables={"main_gun": (3, 40)},     # 7.5% — CRITICAL
+            sample_time_ns=_now_ns(),
+        ),
+        telemetry_windows=_windows(),
+        cm_state=_cm_state(status_name="CONFIG_STATUS_IN_COMPLIANCE"),
+    )
+    status = compute_logistics_status(inputs, _thr(), _now_ns())
+    assert status.overall_severity == ls.LOGISTICS_SEVERITY_CRITICAL
+    # Projected MC remaining should be 0 when already critical.
+    assert status.projected_mission_capable_remaining.seconds == 0
+
+
+def test_cm_not_mission_capable_dominates():
+    inputs = FusionInputs(
+        asset_id=ASSET_ID,
+        platform_variant=VARIANT,
+        latest_telemetry=_telemetry(fuel_value=85.0, sample_time_ns=_now_ns()),
+        telemetry_windows=_windows(),
+        cm_state=_cm_state(status_name="CONFIG_STATUS_NOT_MISSION_CAPABLE"),
+    )
+    status = compute_logistics_status(inputs, _thr(), _now_ns())
+    assert status.overall_severity == ls.LOGISTICS_SEVERITY_NON_OPERATIONAL
+
+
+def test_completely_empty_inputs_get_staleness_factor():
+    inputs = FusionInputs(ASSET_ID, VARIANT, None, None, None)
+    status = compute_logistics_status(inputs, _thr(), _now_ns())
+    assert status.overall_severity == ls.LOGISTICS_SEVERITY_DEGRADED
+    assert any(f.factor_id == "stale_inputs" for f in status.constraining_factors)
+
+
+# ---------------------------------------------------------------------------
+# Edge-case coverage targets — bring branches and config helpers above 90%.
+# ---------------------------------------------------------------------------
+from fusion.rules import (  # noqa: E402
+    _load_fuel_capacity_table,
+    _quantity_to_pint,
+)
+
+
+def test_load_fuel_capacity_table_env_override(monkeypatch):
+    monkeypatch.setenv(
+        "FUEL_CAPACITY_BY_VARIANT",
+        '{"BRADLEY-A4": {"value": 175.0, "unit": "gal_us"}}',
+    )
+    table = _load_fuel_capacity_table()
+    assert "BRADLEY-A4" in table
+    assert pytest.approx(table["BRADLEY-A4"].to("gallon").magnitude) == 175.0
+
+
+def test_load_fuel_capacity_table_invalid_json(monkeypatch):
+    """Invalid JSON env override is logged and ignored; ontology base persists."""
+    monkeypatch.setenv("FUEL_CAPACITY_BY_VARIANT", "{not json")
+    table = _load_fuel_capacity_table()
+    # Ontology base still contributes M1A2-SEPv3; env-only entries don't.
+    assert "M1A2-SEPv3" in table
+
+
+def test_load_fuel_capacity_table_ontology_base():
+    """Without any env override, the ontology file populates the table."""
+    table = _load_fuel_capacity_table()
+    assert "M1A2-SEPv3" in table
+    assert pytest.approx(table["M1A2-SEPv3"].to("gallon").magnitude) == 504.4
+    assert "AH-64E" in table
+
+
+def test_load_fuel_capacity_table_malformed_entry(monkeypatch):
+    monkeypatch.setenv(
+        "FUEL_CAPACITY_BY_VARIANT",
+        '{"GOOD": {"value": 100, "unit": "gal_us"}, "MISSING_UNIT": {"value": 42}}',
+    )
+    table = _load_fuel_capacity_table()
+    assert "GOOD" in table
+    assert "MISSING_UNIT" not in table
+
+
+def test_quantity_to_pint_invalid_unit_returns_none():
+    bad = qpb.Quantity(value=5.0, unit="totally-not-a-unit")
+    assert _quantity_to_pint(bad) is None
+
+
+def test_fuel_unit_incompatible_with_capacity_skips():
+    """Fuel in mass (kg) cannot be converted to volume (gal) without density."""
+    # Patch the module-level capacity table so the test is self-contained
+    # (without env-var coupling).
+    import fusion.rules
+    original = fusion.rules._FUEL_CAPACITY
+    fusion.rules._FUEL_CAPACITY = {VARIANT: __import__("pint").UnitRegistry()
+                                        .Quantity(500.0, "gallon")}
+    try:
+        factor = _eval_fuel(
+            FusionInputs(ASSET_ID, VARIANT,
+                          _telemetry(fuel_value=50.0, fuel_unit="kg"),
+                          None, None),
+            _thr(),
+        )
+        assert factor is None
+    finally:
+        fusion.rules._FUEL_CAPACITY = original
+
+
+def test_wear_unit_conversion_failure_skips():
+    evt = tel.EntityTelemetryEvent()
+    ws = evt.sustainment.wear.components["weird"]
+    ws.hours_in_service.value = 100.0
+    ws.hours_in_service.unit = "kg"  # not a time unit
+    ws.remaining_useful_life.value = 50.0
+    ws.remaining_useful_life.unit = "h"
+    factors = _eval_wear(
+        FusionInputs(ASSET_ID, VARIANT, evt, None, None), _thr(),
+    )
+    assert factors == []
+
+
+def test_mtbf_unit_conversion_failure_skips():
+    w = win.WindowedTelemetry()
+    t = w.wear_trends.add()
+    t.component_key = "weird"
+    t.remaining_useful_life.latest.value = 10.0
+    t.remaining_useful_life.latest.unit = "kg"  # not a time unit
+    t.remaining_useful_life.slope.value = -1.0
+    t.remaining_useful_life.slope.unit = "kg/h"
+    factor = _eval_mtbf(
+        FusionInputs(ASSET_ID, VARIANT, None, w, None), _thr(),
+    )
+    assert factor is None
+
+
+def test_mtbf_far_future_returns_none():
+    """Slope so small that projected hours-to-failure exceeds threshold."""
+    factor = _eval_mtbf(
+        FusionInputs(ASSET_ID, VARIANT, None,
+                      _windows(wear_trends=[("engine", 1000.0, -0.001)]),
+                      None),
+        _thr(),
+    )
+    # 1000 h / 0.001 h/h = 1,000,000 h to failure → far above degraded (8 h)
+    assert factor is None
+
+
+def test_cm_state_unknown_enum_value_returns_none():
+    state = cm.AsMaintainedConfiguration()
+    state.asset_id = ASSET_ID
+    # Force a value outside the enum range by going through SetInParent + manual
+    # field manipulation. Setting an int directly works because protobuf 6.x
+    # tolerates unknown enum ints on the wire.
+    state.overall_status = 99  # not in ConfigurationStatus
+    factor = _eval_cm_state(
+        FusionInputs(ASSET_ID, VARIANT, None, None, state), _thr(),
+    )
+    assert factor is None
+
+
+def test_projected_mc_remaining_propagates_from_factor():
+    """A DEGRADED MTBF factor carries projected_time_to_worse; the composed
+    status should reflect that as projected_mission_capable_remaining."""
+    inputs = FusionInputs(
+        asset_id=ASSET_ID,
+        platform_variant=VARIANT,
+        latest_telemetry=_telemetry(fuel_value=80.0, sample_time_ns=_now_ns()),
+        telemetry_windows=_windows(wear_trends=[("engine", 6.0, -1.0)]),  # 6h to fail
+        cm_state=_cm_state(status_name="CONFIG_STATUS_IN_COMPLIANCE"),
+    )
+    status = compute_logistics_status(inputs, _thr(), _now_ns())
+    assert status.overall_severity == ls.LOGISTICS_SEVERITY_DEGRADED
+    # Should be ~6h = 21600s; allow some slack for the integer truncation.
+    assert 21500 <= status.projected_mission_capable_remaining.seconds <= 21700
