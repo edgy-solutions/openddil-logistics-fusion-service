@@ -260,28 +260,62 @@ def _eval_ammo(inputs: FusionInputs,
     return factors
 
 
+def _factor_origin(sustainment: tel.SustainmentMetrics) -> int:
+    """Read the Phase 5 message-level provenance wildcard, default UNSPECIFIED.
+
+    ADR-0020: derived sustainment carries `value_provenance["*"]` with
+    `origin = ORIGIN_DERIVED`. Sustainment from measured paths has no such
+    entry today; reading it would auto-create one on the proto map (Python
+    proto3 quirk), so guard with explicit `in` check."""
+    if "*" in sustainment.value_provenance:
+        return sustainment.value_provenance["*"].origin
+    return tel.ORIGIN_UNSPECIFIED
+
+
 def _eval_wear(inputs: FusionInputs,
                 thresholds: Thresholds) -> list[ls.ConstrainingFactor]:
-    """One factor per component whose wear% crosses a threshold."""
+    """One factor per component whose wear% crosses a threshold.
+
+    Phase 5 step 2: handles the engine's emit contract — `hours_in_service`
+    / `cycles` in natural units, `remaining_useful_life` in `"%"`. The two
+    branches below cover (a) the legacy time-units shape that measured
+    feeds emit and (b) the percent-shape that the prognostics engine
+    emits. Provenance is read from the sustainment's value_provenance
+    wildcard and stamped on each emitted factor."""
     if inputs.latest_telemetry is None:
         return []
+    sustainment = inputs.latest_telemetry.sustainment
+    origin = _factor_origin(sustainment)
     factors: list[ls.ConstrainingFactor] = []
-    components = inputs.latest_telemetry.sustainment.wear.components
+    components = sustainment.wear.components
     for name, state in components.items():
-        hours = _quantity_to_pint(state.hours_in_service)
-        rul   = _quantity_to_pint(state.remaining_useful_life)
-        if hours is None or rul is None:
+        rul = _quantity_to_pint(state.remaining_useful_life)
+        if rul is None:
             continue
-        try:
-            hours_h = hours.to("h").magnitude
-            rul_h   = rul.to("h").magnitude
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Wear unit conversion failed for %s: %s", name, exc)
-            continue
-        total = hours_h + rul_h
-        if total <= 0:
-            continue
-        pct = hours_h * 100.0 / total
+
+        # Branch on rul unit: percent (engine-emit contract) vs time
+        # (legacy measured-emit contract).
+        if state.remaining_useful_life.unit == "%":
+            # Engine contract: remaining_useful_life is percent-remaining
+            # directly. pct_consumed = 100 - rul. No need to read
+            # hours_in_service for the ratio (it's a natural-unit raw
+            # measure, not part of the ratio).
+            pct = max(0.0, 100.0 - float(state.remaining_useful_life.value))
+        else:
+            # Legacy: hours_in_service + rul both in time units, ratio.
+            hours = _quantity_to_pint(state.hours_in_service)
+            if hours is None:
+                continue
+            try:
+                hours_h = hours.to("h").magnitude
+                rul_h = rul.to("h").magnitude
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Wear unit conversion failed for %s: %s", name, exc)
+                continue
+            total = hours_h + rul_h
+            if total <= 0:
+                continue
+            pct = hours_h * 100.0 / total
 
         if pct >= thresholds.wear_pct_critical:
             sev = ls.LOGISTICS_SEVERITY_CRITICAL
@@ -291,15 +325,25 @@ def _eval_wear(inputs: FusionInputs,
             threshold = thresholds.wear_pct_degraded
         else:
             continue
+
+        # Description string stays clean — provenance is structural.
+        natural_unit = state.hours_in_service.unit or state.cycles.unit or ""
+        natural_value = (state.hours_in_service.value
+                         if state.hours_in_service.unit else state.cycles.value)
         factors.append(ls.ConstrainingFactor(
             factor_id=f"wear.{name}",
             severity=sev,
             description=(
                 f"Component {name} wear at {pct:.1f}% "
-                f"({hours_h:.0f}h in service, {rul_h:.0f}h RUL)"
+                f"({natural_value:.1f}{natural_unit} in service)"
             ),
             current_value=_ucum_quantity(pct, "%"),
             threshold=_ucum_quantity(threshold, "%"),
+            origin=origin,
+            # Phase 5: confidence is meaningfully 0.0 for DERIVED until the
+            # validation phase. For UNSPECIFIED-origin factors the field is
+            # proto3-default 0.0 anyway. See ADR-0020.
+            confidence=0.0,
         ))
     return factors
 

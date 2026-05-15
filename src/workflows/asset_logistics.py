@@ -92,6 +92,13 @@ def _publish_kafka(*, topic: str, key: str, value: bytes) -> None:
 
 # Restate state keys
 _KEY_TELEMETRY = "latest_telemetry_dict"
+# Phase 5 step 2: latest derived-sustainment event for this asset. Separate
+# from `_KEY_TELEMETRY` so the measured/derived merge stays explicit:
+# `_recompute_and_maybe_emit` uses the measured telemetry when present and
+# falls back to derived only when measured is absent (the typical DIS-only
+# asset case). No per-component merging in Phase 5 — the engine sees one or
+# the other.
+_KEY_DERIVED_TELEMETRY = "latest_derived_telemetry_dict"
 _KEY_WINDOWS = "latest_windows_dict"
 _KEY_CM_STATE = "cm_state_dict"
 _KEY_LAST_SEVERITY = "last_emitted_severity"
@@ -165,6 +172,34 @@ async def on_proprietary_update(ctx: restate.ObjectContext, raw: bytes) -> None:
     await _schedule_next_timer(ctx, asset_id)
 
 
+@asset_logistics.handler(
+    "on_derived_sustainment",
+    accept="*/*",
+    input_serde=restate.serde.BytesSerde(),
+)
+async def on_derived_sustainment(ctx: restate.ObjectContext, raw: bytes) -> None:
+    """Consume a Phase 5 prognostics derived-sustainment event.
+
+    The engine (ADR-0020) emits an EntityTelemetryEvent on the
+    `derived-sustainment` topic carrying derived `sustainment.*` values
+    (typically `wear.components`) with `value_provenance["*"] = DERIVED`.
+    For DIS-only assets — which have no measured sustainment — this is the
+    only path that surfaces wear-driven logistics severity.
+
+    Stored under a separate state key so the merge with measured stays
+    explicit: `_recompute_and_maybe_emit` prefers measured when present
+    and falls back to derived otherwise. Per Phase 5 mechanism scope,
+    NOT per-component merged; that arrives with the validation phase."""
+    asset_id = ctx.key()
+    record_dict = _decode_telemetry_event(raw)
+    if not record_dict:
+        return
+
+    ctx.set(_KEY_DERIVED_TELEMETRY, record_dict)
+    await _recompute_and_maybe_emit(ctx, asset_id, trigger="derived_sustainment")
+    await _schedule_next_timer(ctx, asset_id)
+
+
 @asset_logistics.handler("on_timer")
 async def on_timer(ctx: restate.ObjectContext, _: dict | None = None) -> None:
     """Scheduled tick. Recompute (some factors are time-dependent — staleness,
@@ -189,10 +224,17 @@ async def _recompute_and_maybe_emit(
 ) -> None:
     """Pull latest state, run pure rules, emit if transitioning or forced."""
     telemetry_dict = await ctx.get(_KEY_TELEMETRY, type_hint=dict)
+    derived_telemetry_dict = await ctx.get(_KEY_DERIVED_TELEMETRY, type_hint=dict)
     windows_dict = await ctx.get(_KEY_WINDOWS, type_hint=dict)
     cm_dict = await ctx.get(_KEY_CM_STATE, type_hint=dict)
 
-    telemetry_proto = _dict_to_telemetry(telemetry_dict) if telemetry_dict else None
+    # Phase 5 merge rule: measured wins, derived fills the DIS-asset gap.
+    # `on_proprietary_update` already drops DIS-sourced events (no
+    # sustainment), so `_KEY_TELEMETRY` is empty for DIS-only assets;
+    # `_KEY_DERIVED_TELEMETRY` is the only source of wear for them.
+    chosen_telemetry_dict = telemetry_dict or derived_telemetry_dict
+    telemetry_proto = (_dict_to_telemetry(chosen_telemetry_dict)
+                       if chosen_telemetry_dict else None)
     windows_proto = _dict_to_windows(windows_dict) if windows_dict else None
     cm_proto = _dict_to_cm_state(cm_dict) if cm_dict else None
 

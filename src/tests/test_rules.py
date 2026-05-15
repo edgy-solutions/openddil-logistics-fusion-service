@@ -685,3 +685,99 @@ def test_projected_mc_remaining_propagates_from_factor():
     assert status.overall_severity == ls.LOGISTICS_SEVERITY_DEGRADED
     # Should be ~6h = 21600s; allow some slack for the integer truncation.
     assert 21500 <= status.projected_mission_capable_remaining.seconds <= 21700
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 step 2: percent-aware wear branch + provenance read-through
+# ---------------------------------------------------------------------------
+def _derived_wear_telemetry(
+    *, component: str, natural_value: float, natural_unit: str,
+    rul_percent: float,
+) -> tel.EntityTelemetryEvent:
+    """Build telemetry shaped like the prognostics engine's emit contract:
+    natural-unit raw measure in `hours_in_service`, percent-remaining in
+    `remaining_useful_life`, and `value_provenance['*']` carrying
+    ORIGIN_DERIVED."""
+    evt = tel.EntityTelemetryEvent()
+    evt.asset.asset_id = ASSET_ID
+    evt.asset.platform_variant = VARIANT
+    ws = evt.sustainment.wear.components[component]
+    ws.hours_in_service.value = natural_value
+    ws.hours_in_service.unit = natural_unit
+    ws.remaining_useful_life.value = rul_percent
+    ws.remaining_useful_life.unit = "%"
+    evt.sustainment.value_provenance["*"].origin = tel.ORIGIN_DERIVED
+    evt.sustainment.value_provenance["*"].confidence = 0.0
+    return evt
+
+
+def test_wear_percent_branch_degraded():
+    """rul.unit == '%' triggers the percent-aware branch; pct_consumed =
+    100 - rul.value. 20% remaining -> 80% consumed -> DEGRADED band."""
+    factor = _eval_wear(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _derived_wear_telemetry(
+                          component="track", natural_value=8.0,
+                          natural_unit="km", rul_percent=20.0,
+                      ),
+                      None, None),
+        _thr(),
+    )
+    # _eval_wear returns a list (one factor per crossed-threshold component).
+    assert len(factor) == 1
+    assert factor[0].factor_id == "wear.track"
+    assert factor[0].severity == ls.LOGISTICS_SEVERITY_DEGRADED
+    assert factor[0].current_value.unit == "%"
+    assert factor[0].current_value.value == pytest.approx(80.0)
+
+
+def test_wear_percent_branch_critical():
+    """5% remaining -> 95% consumed -> CRITICAL band."""
+    factor = _eval_wear(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _derived_wear_telemetry(
+                          component="suspension", natural_value=95.0,
+                          natural_unit="deg.km", rul_percent=5.0,
+                      ),
+                      None, None),
+        _thr(),
+    )
+    assert len(factor) == 1
+    assert factor[0].factor_id == "wear.suspension"
+    assert factor[0].severity == ls.LOGISTICS_SEVERITY_CRITICAL
+
+
+def test_wear_factor_stamps_origin_from_value_provenance():
+    """Provenance read-through: when sustainment.value_provenance['*'] is
+    ORIGIN_DERIVED, the emitted factor's origin matches. Phase 5 step 2
+    structural distinction — replaces the description-string `(derived)`
+    tag idea."""
+    factors = _eval_wear(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _derived_wear_telemetry(
+                          component="track", natural_value=8.0,
+                          natural_unit="km", rul_percent=20.0,
+                      ),
+                      None, None),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].origin == tel.ORIGIN_DERIVED
+    assert factors[0].confidence == 0.0  # accurate value, not a placeholder
+
+
+def test_wear_factor_origin_unspecified_for_legacy_measured_path():
+    """Sustainment with NO value_provenance entry — the existing time-units
+    measured path — gets origin=ORIGIN_UNSPECIFIED via proto3 default. The
+    `'*' in value_provenance` guard prevents the proto-map autocreate
+    quirk."""
+    factors = _eval_wear(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(wear={"transmission": (900.0, 100.0)}),  # 90%
+                      None, None),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].origin == tel.ORIGIN_UNSPECIFIED
+    # And the legacy time-units path must still produce the correct severity.
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_CRITICAL

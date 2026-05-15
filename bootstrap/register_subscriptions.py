@@ -70,6 +70,18 @@ def _subscriptions() -> list[Subscription]:
             consumer_group=os.getenv("FUSION_GROUP_SILVER",
                                        "fusion-service-silver"),
         ),
+        # Phase 5 step 2: derived sustainment from the prognostics engine
+        # (ADR-0020). Lands `EntityTelemetryEvent`s carrying derived
+        # `sustainment.wear` for DIS-only assets that have no measured
+        # sustainment otherwise. The handler stores it under a separate
+        # state slot; the recompute path prefers measured and falls back
+        # to derived (Phase 5 mechanism scope; no per-component merge).
+        Subscription(
+            topic=os.getenv("FUSION_TOPIC_DERIVED", "derived-sustainment"),
+            handler="AssetLogistics/on_derived_sustainment",
+            consumer_group=os.getenv("FUSION_GROUP_DERIVED",
+                                       "fusion-service-derived"),
+        ),
     ]
 
 
