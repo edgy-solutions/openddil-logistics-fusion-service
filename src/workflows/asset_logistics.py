@@ -75,6 +75,42 @@ def _thresholds() -> Thresholds:
 
 
 # Kafka publisher hook (installed by main.py).
+def _extract_origin(event_dict: dict | None) -> tuple[str, str]:
+    """Pull origin-node provenance from any of the four inbound shapes.
+
+    Phase 6b §A: cm-state events carry edge_id/region_id at the JSON
+    envelope's top level (cm-service stamps top-level snake_case via
+    dataclasses.asdict). Telemetry / windowed / derived events carry it
+    in nested provenance, encoded via MessageToDict(preserving_proto_
+    field_name=False) → camelCase. Helper handles all combinations so
+    per-handler call-sites stay one-liner."""
+    if not event_dict:
+        return "", ""
+    # cm-state envelope: top-level snake_case
+    top_edge = event_dict.get("edge_id")
+    if top_edge:
+        return top_edge, event_dict.get("region_id", "") or ""
+    # Proto-derived events: nested provenance, EITHER snake_case OR
+    # camelCase depending on the decoder used.
+    prov = event_dict.get("provenance") or {}
+    edge = prov.get("edgeId") or prov.get("edge_id") or ""
+    region = prov.get("regionId") or prov.get("region_id") or ""
+    return edge, region
+
+
+async def _refresh_origin(ctx, event_dict: dict | None) -> None:
+    """Update the per-asset _KEY_ORIGIN from the inbound event. Stored so
+    emissions from on_timer (no fresh inbound event) inherit the asset's
+    last-known edge attribution."""
+    edge_id, region_id = _extract_origin(event_dict)
+    if edge_id or region_id:
+        existing = await ctx.get(_KEY_ORIGIN, type_hint=dict) or {}
+        ctx.set(_KEY_ORIGIN, {
+            "edge_id":   edge_id or existing.get("edge_id", ""),
+            "region_id": region_id or existing.get("region_id", ""),
+        })
+
+
 _publish_kafka_fn = None
 
 
@@ -91,6 +127,7 @@ def _publish_kafka(*, topic: str, key: str, value: bytes) -> None:
 
 
 # Restate state keys
+_KEY_ORIGIN = "origin_node"
 _KEY_TELEMETRY = "latest_telemetry_dict"
 # Phase 5 step 2: latest derived-sustainment event for this asset. Separate
 # from `_KEY_TELEMETRY` so the measured/derived merge stays explicit:
@@ -126,6 +163,7 @@ async def on_telemetry_window(ctx: restate.ObjectContext, raw: bytes) -> None:
         return
 
     ctx.set(_KEY_WINDOWS, record_dict)
+    await _refresh_origin(ctx, record_dict)
     await _recompute_and_maybe_emit(ctx, asset_id, trigger="windowed_telemetry")
     await _schedule_next_timer(ctx, asset_id)
 
@@ -144,6 +182,7 @@ async def on_cm_state_change(ctx: restate.ObjectContext, raw: bytes) -> None:
         return
 
     ctx.set(_KEY_CM_STATE, state_dict)
+    await _refresh_origin(ctx, state_dict)
     await _recompute_and_maybe_emit(ctx, asset_id, trigger="cm_state_change")
     await _schedule_next_timer(ctx, asset_id)
 
@@ -168,6 +207,7 @@ async def on_proprietary_update(ctx: restate.ObjectContext, raw: bytes) -> None:
         return
 
     ctx.set(_KEY_TELEMETRY, record_dict)
+    await _refresh_origin(ctx, record_dict)
     await _recompute_and_maybe_emit(ctx, asset_id, trigger="telemetry")
     await _schedule_next_timer(ctx, asset_id)
 
@@ -196,6 +236,7 @@ async def on_derived_sustainment(ctx: restate.ObjectContext, raw: bytes) -> None
         return
 
     ctx.set(_KEY_DERIVED_TELEMETRY, record_dict)
+    await _refresh_origin(ctx, record_dict)
     await _recompute_and_maybe_emit(ctx, asset_id, trigger="derived_sustainment")
     await _schedule_next_timer(ctx, asset_id)
 
@@ -271,6 +312,17 @@ async def _recompute_and_maybe_emit(
         is_transition=is_transition,
         is_initial=is_initial,
     )
+
+    # Phase 6b §A: stamp origin-node provenance from the asset's stored
+    # _KEY_ORIGIN (inherited from inbound events via _refresh_origin).
+    # The projector logistics_status handler will read this and write it
+    # to the per-asset row's edge_id / region_id columns.
+    origin = await ctx.get(_KEY_ORIGIN, type_hint=dict) or {}
+    if origin.get("edge_id"):
+        update.provenance.edge_id = origin["edge_id"]
+    if origin.get("region_id"):
+        update.provenance.region_id = origin["region_id"]
+    update.provenance.producer_id = "logistics-fusion-service"
 
     await ctx.run(
         "publish-asset-logistics-status",
