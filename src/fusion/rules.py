@@ -175,6 +175,10 @@ class FusionInputs:
     latest_telemetry: tel.EntityTelemetryEvent | None
     telemetry_windows: win.WindowedTelemetry | None
     cm_state: cm.AsMaintainedConfiguration | None
+    # Sub-phase F: the customer-overlay capability snapshot (Silver
+    # `asset-capability-snapshot` — a JSON dict, not a proto). Optional and
+    # last so every existing positional construction site keeps working.
+    capability_snapshot: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +352,67 @@ def _eval_wear(inputs: FusionInputs,
     return factors
 
 
+def _eval_inventory(inputs: FusionInputs,
+                     thresholds: Thresholds) -> list[ls.ConstrainingFactor]:
+    """Engagement-worthiness from the customer capability snapshot.
+
+    Sub-phase F. The customer's StrikeCapabilityMessage feed (Silver topic
+    `asset-capability-snapshot`) carries the current Ammo count for every
+    loaded store on an asset. A store at zero Ammo cannot engage
+    (AMMO_EXHAUSTED → CRITICAL); a store running low is a DEGRADED warning
+    (AMMO_LOW). The snapshot reports an absolute count, not a percent — the
+    feed has no per-store capacity — so this evaluator bands on
+    `thresholds.ammo_low_count` rather than a percentage. (Distinct from
+    `_eval_ammo`, which bands on percent-of-capacity from the *telemetry*
+    sustainment block; the two never see the same asset in practice.)
+
+    Both factors are stamped `origin = ORIGIN_DERIVED`, the same contract
+    as `_eval_wear`: the Ammo count is a customer-fed measurement, but the
+    *engagement-worthiness assessment* ("can this asset still engage?") is
+    an OpenDDIL-derived conclusion. `confidence` stays 0.0 — no oracle,
+    per ADR-0020."""
+    snapshot = inputs.capability_snapshot
+    if not snapshot:
+        return []
+    factors: list[ls.ConstrainingFactor] = []
+    for store in snapshot.get("capabilities") or []:
+        if not isinstance(store, dict):
+            continue
+        ammo = store.get("ammo")
+        if not isinstance(ammo, (int, float)):
+            continue  # field absent or non-numeric — no claim
+        ammo = int(ammo)
+        cap_id = store.get("capability_id") or ""
+        store_loc = store.get("store_location")
+        cap_key = cap_id or (f"store-{store_loc}" if store_loc is not None
+                             else "store")
+
+        if ammo <= 0:
+            sev = ls.LOGISTICS_SEVERITY_CRITICAL
+            state = "AMMO_EXHAUSTED"
+            threshold = 0
+        elif ammo <= thresholds.ammo_low_count:
+            sev = ls.LOGISTICS_SEVERITY_DEGRADED
+            state = "AMMO_LOW"
+            threshold = thresholds.ammo_low_count
+        else:
+            continue
+
+        factors.append(ls.ConstrainingFactor(
+            factor_id=f"inventory.{cap_key}",
+            severity=sev,
+            description=(
+                f"{state}: {cap_key} has {ammo} round(s) loaded "
+                f"(store {store_loc})"
+            ),
+            current_value=_ucum_quantity(float(ammo), "{round}"),
+            threshold=_ucum_quantity(float(threshold), "{round}"),
+            origin=tel.ORIGIN_DERIVED,
+            confidence=0.0,
+        ))
+    return factors
+
+
 def _eval_mtbf(inputs: FusionInputs,
                 thresholds: Thresholds) -> ls.ConstrainingFactor | None:
     """Soonest projected component failure from windowed RUL slopes.
@@ -464,6 +529,13 @@ def _eval_staleness(inputs: FusionInputs,
                      thresholds: Thresholds,
                      now_ns: int) -> ls.ConstrainingFactor | None:
     if inputs.latest_telemetry is None:
+        # A capability-only asset (customer overlay — no DIS / sustainment
+        # telemetry, only the StrikeCapabilityMessage feed) IS being
+        # observed; the capability snapshot is its input. Don't false-flag
+        # it "no telemetry". Staleness of the capability feed itself is out
+        # of Sub-phase F scope.
+        if inputs.capability_snapshot:
+            return None
         return ls.ConstrainingFactor(
             factor_id="stale_inputs",
             severity=ls.LOGISTICS_SEVERITY_DEGRADED,
@@ -501,6 +573,7 @@ def compute_logistics_status(
         factors.append(f)
     factors.extend(_eval_ammo(inputs, thresholds))
     factors.extend(_eval_wear(inputs, thresholds))
+    factors.extend(_eval_inventory(inputs, thresholds))
     if (f := _eval_mtbf(inputs, thresholds)):
         factors.append(f)
     factors.extend(_eval_subsystems(inputs, thresholds))

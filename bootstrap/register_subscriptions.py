@@ -78,6 +78,17 @@ def _per_edge_subscriptions(edge_id: str) -> list[Subscription]:
             handler="AssetLogistics/on_derived_sustainment",
             consumer_group=f"fusion-service-derived-{edge_id}",
         ),
+        # Sub-phase F — engagement-worthiness. The customer-overlay
+        # StrikeCapabilityMessage feed lands on asset-capability-snapshot
+        # (Silver, JSON). The topic is created on every edge cluster
+        # (topic-init parity), so subscribing on all edges is safe — the
+        # consumer is simply idle on edges the customer feed does not
+        # target (edge-01 by convention today).
+        Subscription(
+            topic="asset-capability-snapshot",
+            handler="AssetLogistics/on_capability_snapshot",
+            consumer_group=f"fusion-service-capability-{edge_id}",
+        ),
     ]
 
 

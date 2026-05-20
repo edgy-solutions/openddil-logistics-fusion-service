@@ -16,6 +16,13 @@ Inputs (delivered by Restate Kafka subscriptions):
     - source topic: raw-sensor-stream
     - filtered by sustainment-presence in the handler (DIS lacks sustainment;
       sim-a and proprietary feeds carry it)
+  on_derived_sustainment(EntityTelemetryEvent-bytes)
+    - source topic: derived-sustainment
+    - Phase 5 prognostics engine; wear values stamped ORIGIN_DERIVED
+  on_capability_snapshot(AssetCapabilitySnapshot-JSON)
+    - source topic: asset-capability-snapshot
+    - customer-overlay StrikeCapabilityMessage feed; drives the
+      engagement-worthiness evaluator (Sub-phase F)
   on_timer()
     - scheduled callback, fires every EMIT_INTERVAL_SECONDS
 
@@ -23,12 +30,14 @@ Output:
   AssetLogisticsStatusUpdate -> asset-logistics-status (compacted, keyed by asset_id)
 
 Durable state keys per asset:
-  latest_telemetry_dict      — last EntityTelemetryEvent (as dict) with sustainment
-  latest_windows_dict        — last WindowedTelemetry (as dict)
-  cm_state_dict              — last AsMaintainedConfiguration (as dict)
-  last_emitted_severity      — int (LogisticsSeverity enum value)
-  status_revision            — uint64, increments per emission
-  next_timer_ns              — int, unix ns of the next scheduled on_timer
+  latest_telemetry_dict          — last EntityTelemetryEvent (as dict) with sustainment
+  latest_derived_telemetry_dict  — last derived-sustainment EntityTelemetryEvent
+  latest_windows_dict            — last WindowedTelemetry (as dict)
+  cm_state_dict                  — last AsMaintainedConfiguration (as dict)
+  latest_capability_dict         — last AssetCapabilitySnapshot (as dict)
+  last_emitted_severity          — int (LogisticsSeverity enum value)
+  status_revision                — uint64, increments per emission
+  next_timer_ns                  — int, unix ns of the next scheduled on_timer
 """
 from __future__ import annotations
 
@@ -138,6 +147,10 @@ _KEY_TELEMETRY = "latest_telemetry_dict"
 _KEY_DERIVED_TELEMETRY = "latest_derived_telemetry_dict"
 _KEY_WINDOWS = "latest_windows_dict"
 _KEY_CM_STATE = "cm_state_dict"
+# Sub-phase F: latest customer-overlay capability snapshot for this asset
+# (the StrikeCapabilityMessage feed, Silver topic asset-capability-snapshot).
+# Drives the engagement-worthiness evaluator (`_eval_inventory`).
+_KEY_CAPABILITY = "latest_capability_dict"
 _KEY_LAST_SEVERITY = "last_emitted_severity"
 _KEY_REVISION = "status_revision"
 _KEY_NEXT_TIMER = "next_timer_ns"
@@ -241,6 +254,35 @@ async def on_derived_sustainment(ctx: restate.ObjectContext, raw: bytes) -> None
     await _schedule_next_timer(ctx, asset_id)
 
 
+@asset_logistics.handler(
+    "on_capability_snapshot",
+    accept="*/*",
+    input_serde=restate.serde.BytesSerde(),
+)
+async def on_capability_snapshot(ctx: restate.ObjectContext, raw: bytes) -> None:
+    """Consume a customer-overlay capability snapshot (Sub-phase F).
+
+    Source topic: `asset-capability-snapshot` (Silver, JSON). The customer
+    StrikeCapabilityMessage feed lands here via the customer-overlay connect
+    overlay; each message is the current per-store Ammo state for one
+    asset. Drives the engagement-worthiness evaluator (`_eval_inventory`)
+    — `AMMO_LOW` / `AMMO_EXHAUSTED` ConstrainingFactors carried on the
+    existing `asset-logistics-status` output, no new topic.
+
+    A capability-only asset has no measured telemetry; the snapshot is its
+    sole input. `_recompute_and_maybe_emit` runs the full rule set against
+    whatever state is present, so this path needs no special-casing."""
+    asset_id = ctx.key()
+    snapshot = _decode_capability_snapshot(raw)
+    if not snapshot:
+        return
+
+    ctx.set(_KEY_CAPABILITY, snapshot)
+    await _refresh_origin(ctx, snapshot)
+    await _recompute_and_maybe_emit(ctx, asset_id, trigger="capability_snapshot")
+    await _schedule_next_timer(ctx, asset_id)
+
+
 @asset_logistics.handler("on_timer")
 async def on_timer(ctx: restate.ObjectContext, _: dict | None = None) -> None:
     """Scheduled tick. Recompute (some factors are time-dependent — staleness,
@@ -268,6 +310,7 @@ async def _recompute_and_maybe_emit(
     derived_telemetry_dict = await ctx.get(_KEY_DERIVED_TELEMETRY, type_hint=dict)
     windows_dict = await ctx.get(_KEY_WINDOWS, type_hint=dict)
     cm_dict = await ctx.get(_KEY_CM_STATE, type_hint=dict)
+    capability_dict = await ctx.get(_KEY_CAPABILITY, type_hint=dict)
 
     # Phase 5 merge rule: measured wins, derived fills the DIS-asset gap.
     # `on_proprietary_update` already drops DIS-sourced events (no
@@ -291,6 +334,7 @@ async def _recompute_and_maybe_emit(
         latest_telemetry=telemetry_proto,
         telemetry_windows=windows_proto,
         cm_state=cm_proto,
+        capability_snapshot=capability_dict or None,
     )
     now_ns = _now_ns(ctx)
     status = compute_logistics_status(inputs, _thresholds(), now_ns)
@@ -419,6 +463,25 @@ def _decode_cm_state(raw: bytes | dict | None) -> dict:
         return MessageToDict(state, preserving_proto_field_name=False)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to decode cm-state payload (len=%d): %s",
+                        len(raw) if raw else 0, exc)
+        return {}
+
+
+def _decode_capability_snapshot(raw: bytes | dict | None) -> dict:
+    """asset-capability-snapshot is a plain-JSON Silver shape — the customer
+    StrikeCapabilityMessage Bloblang produces JSON, not proto. No proto
+    fallback (unlike cm-state): this topic is JSON-only by contract."""
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        text = (raw.decode("utf-8")
+                if isinstance(raw, (bytes, bytearray)) else str(raw))
+        decoded = json.loads(text)
+        return decoded if isinstance(decoded, dict) else {}
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to decode capability snapshot (len=%d): %s",
                         len(raw) if raw else 0, exc)
         return {}
 

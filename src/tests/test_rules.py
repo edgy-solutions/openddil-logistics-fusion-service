@@ -24,6 +24,7 @@ from fusion.rules import (
     _eval_fuel,
     _eval_ammo,
     _eval_wear,
+    _eval_inventory,
     _eval_mtbf,
     _eval_subsystems,
     _eval_cm_state,
@@ -51,6 +52,7 @@ def _thr(**overrides) -> Thresholds:
         "wear_pct_degraded":    base.wear_pct_degraded,
         "mtbf_hours_critical":  base.mtbf_hours_critical,
         "mtbf_hours_degraded":  base.mtbf_hours_degraded,
+        "ammo_low_count":       base.ammo_low_count,
         "emit_interval_seconds": base.emit_interval_seconds,
         "stale_input_seconds":  base.stale_input_seconds,
         "subsystem_health_map": dict(base.subsystem_health_map),
@@ -128,6 +130,31 @@ def _windows(
             t.remaining_useful_life.slope.value = slope
             t.remaining_useful_life.slope.unit = "h/h"
     return w
+
+
+def _store(capability_id: str, ammo: int, *, store_location: int = 1,
+            store_category: str = "AIR") -> dict:
+    """One per-store entry of the asset-capability-snapshot Silver shape."""
+    return {
+        "capability_id": capability_id,
+        "store_location": store_location,
+        "store_category": store_category,
+        "ammo": ammo,
+        "simulated": True,
+    }
+
+
+def _capability_snapshot(*stores: dict) -> dict:
+    """The asset-capability-snapshot Silver shape (JSON) produced by the
+    customer-overlay strike-capability Bloblang. Only the fields `_eval_inventory`
+    reads are required."""
+    return {
+        "schema_revision": 1,
+        "asset_id": ASSET_ID,
+        "schema_version": "002.3",
+        "mode": "SIMULATION",
+        "capabilities": list(stores),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +345,129 @@ def test_wear_unset_quantities_skip():
         _thr(),
     )
     assert factors == []
+
+
+# ---------------------------------------------------------------------------
+# Inventory / engagement-worthiness evaluator (Sub-phase F)
+# ---------------------------------------------------------------------------
+def test_inventory_exhausted_is_critical():
+    factors = _eval_inventory(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None,
+                      capability_snapshot=_capability_snapshot(
+                          _store("MRAD_Interceptor", 0))),
+        _thr(),
+    )
+    assert len(factors) == 1
+    f = factors[0]
+    assert f.factor_id == "inventory.MRAD_Interceptor"
+    assert f.severity == ls.LOGISTICS_SEVERITY_CRITICAL
+    assert "AMMO_EXHAUSTED" in f.description
+    assert f.origin == tel.ORIGIN_DERIVED
+
+
+def test_inventory_low_is_degraded():
+    factors = _eval_inventory(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None,
+                      capability_snapshot=_capability_snapshot(
+                          _store("MRAD_Interceptor", 3))),  # <= ammo_low_count
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_DEGRADED
+    assert "AMMO_LOW" in factors[0].description
+
+
+def test_inventory_at_threshold_is_degraded():
+    # Boundary: ammo == ammo_low_count is inclusive (still AMMO_LOW).
+    factors = _eval_inventory(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None,
+                      capability_snapshot=_capability_snapshot(
+                          _store("MRAD_Interceptor", 5))),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_DEGRADED
+
+
+def test_inventory_above_threshold_no_factor():
+    factors = _eval_inventory(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None,
+                      capability_snapshot=_capability_snapshot(
+                          _store("MRAD_Interceptor", 40))),
+        _thr(),
+    )
+    assert factors == []
+
+
+def test_inventory_multiple_stores_one_constrained():
+    factors = _eval_inventory(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None,
+                      capability_snapshot=_capability_snapshot(
+                          _store("Interceptor_A", 0, store_location=1),
+                          _store("Interceptor_B", 50, store_location=2))),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].factor_id == "inventory.Interceptor_A"
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_CRITICAL
+
+
+def test_inventory_no_snapshot_skips():
+    assert _eval_inventory(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None,
+                      capability_snapshot=None),
+        _thr(),
+    ) == []
+
+
+def test_inventory_missing_ammo_field_skips():
+    # A store entry with no numeric `ammo` makes no claim — skipped, not 0.
+    factors = _eval_inventory(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None,
+                      capability_snapshot=_capability_snapshot(
+                          {"capability_id": "X", "store_location": 1})),
+        _thr(),
+    )
+    assert factors == []
+
+
+def test_inventory_fallback_factor_id_when_no_capability_id():
+    factors = _eval_inventory(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None,
+                      capability_snapshot=_capability_snapshot(
+                          _store("", 0, store_location=7))),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].factor_id == "inventory.store-7"
+
+
+def test_inventory_custom_low_threshold():
+    # AMMO_LOW_COUNT override flows through _thr into the banding.
+    factors = _eval_inventory(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None,
+                      capability_snapshot=_capability_snapshot(
+                          _store("MRAD_Interceptor", 8))),
+        _thr(ammo_low_count=10),
+    )
+    assert len(factors) == 1
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_DEGRADED
+
+
+def test_capability_only_asset_surfaces_factor_without_stale_flag():
+    # A capability-only asset (no telemetry/windows/cm) must NOT get a
+    # spurious "no telemetry observed" stale_inputs factor — the capability
+    # snapshot is a real input. compute_logistics_status integration check.
+    status = compute_logistics_status(
+        FusionInputs(ASSET_ID, "", None, None, None,
+                      capability_snapshot=_capability_snapshot(
+                          _store("MRAD_Interceptor", 0))),
+        _thr(), _now_ns(),
+    )
+    factor_ids = {f.factor_id for f in status.constraining_factors}
+    assert "inventory.MRAD_Interceptor" in factor_ids
+    assert "stale_inputs" not in factor_ids
+    assert status.overall_severity == ls.LOGISTICS_SEVERITY_CRITICAL
 
 
 # ---------------------------------------------------------------------------

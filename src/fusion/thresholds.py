@@ -31,6 +31,13 @@ class Thresholds:
     ammo_pct_critical: float = 10.0
     ammo_pct_degraded: float = 25.0
 
+    # Engagement-worthiness (Sub-phase F) — the customer capability
+    # snapshot reports an absolute Ammo count per loaded store, not a
+    # percent (the feed carries no per-store capacity). A store at or
+    # below this count is AMMO_LOW (DEGRADED); a store at zero is
+    # AMMO_EXHAUSTED (CRITICAL).
+    ammo_low_count: int = 5
+
     # Component wear — % of useful-life consumed.
     wear_pct_critical: float = 90.0
     wear_pct_degraded: float = 75.0
@@ -96,6 +103,7 @@ class Thresholds:
             fuel_pct_degraded    = float(os.getenv("FUEL_PCT_DEGRADED",    "30")),
             ammo_pct_critical    = float(os.getenv("AMMO_PCT_CRITICAL",    "10")),
             ammo_pct_degraded    = float(os.getenv("AMMO_PCT_DEGRADED",    "25")),
+            ammo_low_count       = int(os.getenv("AMMO_LOW_COUNT",        "5")),
             wear_pct_critical    = float(os.getenv("WEAR_PCT_CRITICAL",    "90")),
             wear_pct_degraded    = float(os.getenv("WEAR_PCT_DEGRADED",    "75")),
             mtbf_hours_critical  = float(os.getenv("MTBF_HOURS_CRITICAL",  "2")),
