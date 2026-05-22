@@ -35,6 +35,10 @@ ENV PYTHONPATH=/proto:/app/src:/app
 
 WORKDIR /app
 COPY src /app/src
+# bootstrap/register_subscriptions.py is executed by the
+# logistics-fusion-bootstrap Helm hook Job (same image, command overridden)
+# — bake it into the image.
+COPY bootstrap /app/bootstrap
 
 EXPOSE 9081/tcp
 
