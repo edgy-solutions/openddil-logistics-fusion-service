@@ -494,6 +494,86 @@ def _eval_subsystems(inputs: FusionInputs,
     return factors
 
 
+def _eval_operational_state(inputs: FusionInputs,
+                              thresholds: Thresholds) -> list[ls.ConstrainingFactor]:
+    """Map OperationalState's 3 axes -> ConstrainingFactor entries.
+
+    OperationalState is a generic 3-axis posture model (power × mode ×
+    health, plus discrete RX/TX cues) populated by any source that carries
+    entity operational state — proprietary sensor feeds, DIS EmissionSystem
+    + EntityState appearance, AFSim sensor/platform state, VRForces damage
+    states, etc. See openddil.telemetry.v1.OperationalState for the proto.
+
+    Severity mapping per axis (this evaluator is the policy embodiment of
+    the table in the proto comments + the operational-state ADR):
+
+      power_state == OFF          -> CRITICAL, factor_id="operational.offline"
+      power_state == SHUTTING_DOWN -> CRITICAL, factor_id="operational.shutdown"
+      power_state == MAINTENANCE  -> DEGRADED, factor_id="operational.maintenance"
+      health_state == FAILED      -> CRITICAL, factor_id="operational.failed"
+      health_state == FAULT       -> CRITICAL, factor_id="operational.fault"
+      health_state == DEGRADED    -> DEGRADED, factor_id="operational.degraded"
+      otherwise                   -> no factor (healthy posture)
+
+    Multiple axes can each contribute a factor (e.g. an entity reporting
+    POWER_STATE_MAINTENANCE + HEALTH_STATE_DEGRADED gets both factors).
+    Distinct from `_eval_subsystems` above which reads per-component fault
+    codes from `sustainment.health.active_fault_codes` (mobile-platform
+    BIT); the `operational.*` factor_id namespace stays semantically
+    separate from `subsystem.<NAME>`.
+    """
+    if inputs.latest_telemetry is None:
+        return []
+    op = inputs.latest_telemetry.operational_state
+    factors: list[ls.ConstrainingFactor] = []
+
+    # ---- PowerState axis ----
+    if op.power_state == tel.POWER_STATE_OFF:
+        factors.append(ls.ConstrainingFactor(
+            factor_id="operational.offline",
+            severity=ls.LOGISTICS_SEVERITY_CRITICAL,
+            description="Entity is powered off",
+        ))
+    elif op.power_state == tel.POWER_STATE_SHUTTING_DOWN:
+        factors.append(ls.ConstrainingFactor(
+            factor_id="operational.shutdown",
+            severity=ls.LOGISTICS_SEVERITY_CRITICAL,
+            description="Entity is executing or completed shutdown",
+        ))
+    elif op.power_state == tel.POWER_STATE_MAINTENANCE:
+        factors.append(ls.ConstrainingFactor(
+            factor_id="operational.maintenance",
+            severity=ls.LOGISTICS_SEVERITY_DEGRADED,
+            description="Entity is in a scheduled maintenance window",
+        ))
+
+    # ---- HealthState axis (orthogonal — fires alongside any power state) ----
+    if op.health_state == tel.HEALTH_STATE_FAILED:
+        factors.append(ls.ConstrainingFactor(
+            factor_id="operational.failed",
+            severity=ls.LOGISTICS_SEVERITY_CRITICAL,
+            description="Entity has hard-failed and requires service",
+        ))
+    elif op.health_state == tel.HEALTH_STATE_FAULT:
+        factors.append(ls.ConstrainingFactor(
+            factor_id="operational.fault",
+            severity=ls.LOGISTICS_SEVERITY_CRITICAL,
+            description="Entity has an active fault requiring attention",
+        ))
+    elif op.health_state == tel.HEALTH_STATE_DEGRADED:
+        factors.append(ls.ConstrainingFactor(
+            factor_id="operational.degraded",
+            severity=ls.LOGISTICS_SEVERITY_DEGRADED,
+            description="Entity has a non-critical anomaly limiting capability",
+        ))
+
+    # FunctionalMode is informational only — it does NOT drive severity by
+    # itself (IDLE vs ACTIVE vs RECEIVE_ONLY are operator postures, not
+    # faults). Visible to consumers via the raw OperationalState block.
+
+    return factors
+
+
 def _eval_cm_state(inputs: FusionInputs,
                     thresholds: Thresholds) -> ls.ConstrainingFactor | None:
     if inputs.cm_state is None:
@@ -577,6 +657,7 @@ def compute_logistics_status(
     if (f := _eval_mtbf(inputs, thresholds)):
         factors.append(f)
     factors.extend(_eval_subsystems(inputs, thresholds))
+    factors.extend(_eval_operational_state(inputs, thresholds))
     if (f := _eval_cm_state(inputs, thresholds)):
         factors.append(f)
     if (f := _eval_staleness(inputs, thresholds, now_ns)):
