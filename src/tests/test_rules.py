@@ -27,6 +27,7 @@ from fusion.rules import (
     _eval_inventory,
     _eval_mtbf,
     _eval_subsystems,
+    _eval_operational_state,
     _eval_cm_state,
     _eval_staleness,
 )
@@ -558,6 +559,257 @@ def test_subsystem_token_without_colon_handled():
     )
     assert len(factors) == 1
     assert factors[0].factor_id == "subsystem.unknown"
+
+
+# ---------------------------------------------------------------------------
+# OperationalState evaluator (ADR-0026)
+# ---------------------------------------------------------------------------
+# These tests pin the policy table in _eval_operational_state — the
+# mapping from proto enum values to ConstrainingFactor entries. The
+# policy is the visible contract for "what severity does each posture
+# axis produce" and the most-trafficked code path in the customer-overlay
+# pipeline (every sensor heartbeat goes through it). Without these,
+# any well-intentioned refactor that touches the if/elif ladder
+# silently changes ring colors across the entire deployment.
+
+def _op_state_telemetry(
+    *,
+    power_state: int | None = None,
+    health_state: int | None = None,
+    functional_mode: int | None = None,
+    actively_receiving: bool | None = None,
+    actively_transmitting: bool | None = None,
+) -> tel.EntityTelemetryEvent:
+    """Helper: build an EntityTelemetryEvent with operational_state populated.
+    Fields default to the proto's UNSPECIFIED (= 0) when omitted."""
+    evt = tel.EntityTelemetryEvent()
+    evt.asset.asset_id = ASSET_ID
+    evt.asset.platform_variant = VARIANT
+    if power_state is not None:
+        evt.operational_state.power_state = power_state
+    if health_state is not None:
+        evt.operational_state.health_state = health_state
+    if functional_mode is not None:
+        evt.operational_state.functional_mode = functional_mode
+    if actively_receiving is not None:
+        evt.operational_state.actively_receiving = actively_receiving
+    if actively_transmitting is not None:
+        evt.operational_state.actively_transmitting = actively_transmitting
+    return evt
+
+
+def _op_inputs(evt: tel.EntityTelemetryEvent) -> FusionInputs:
+    return FusionInputs(ASSET_ID, VARIANT, evt, None, None)
+
+
+# -- PowerState axis: 3 non-OK transitions ----------------------------------
+
+def test_operational_state_power_off_is_critical():
+    factors = _eval_operational_state(
+        _op_inputs(_op_state_telemetry(power_state=tel.POWER_STATE_OFF)),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].factor_id == "operational.offline"
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_CRITICAL
+    assert "powered off" in factors[0].description.lower()
+
+
+def test_operational_state_power_shutting_down_is_critical():
+    factors = _eval_operational_state(
+        _op_inputs(_op_state_telemetry(power_state=tel.POWER_STATE_SHUTTING_DOWN)),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].factor_id == "operational.shutdown"
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_CRITICAL
+
+
+def test_operational_state_power_maintenance_is_degraded():
+    factors = _eval_operational_state(
+        _op_inputs(_op_state_telemetry(power_state=tel.POWER_STATE_MAINTENANCE)),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].factor_id == "operational.maintenance"
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_DEGRADED
+
+
+# -- HealthState axis: 3 non-NOMINAL transitions ----------------------------
+
+def test_operational_state_health_failed_is_critical():
+    factors = _eval_operational_state(
+        _op_inputs(_op_state_telemetry(health_state=tel.HEALTH_STATE_FAILED)),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].factor_id == "operational.failed"
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_CRITICAL
+
+
+def test_operational_state_health_fault_is_critical():
+    factors = _eval_operational_state(
+        _op_inputs(_op_state_telemetry(health_state=tel.HEALTH_STATE_FAULT)),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].factor_id == "operational.fault"
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_CRITICAL
+
+
+def test_operational_state_health_degraded_is_degraded():
+    factors = _eval_operational_state(
+        _op_inputs(_op_state_telemetry(health_state=tel.HEALTH_STATE_DEGRADED)),
+        _thr(),
+    )
+    assert len(factors) == 1
+    assert factors[0].factor_id == "operational.degraded"
+    assert factors[0].severity == ls.LOGISTICS_SEVERITY_DEGRADED
+
+
+# -- Axes are orthogonal: both can fire on one event ------------------------
+
+def test_operational_state_power_and_health_both_fire():
+    """Per the ADR-0026 policy comment in rules.py: multiple axes can each
+    contribute a factor (e.g. POWER_MAINTENANCE + HEALTH_DEGRADED gets
+    both). The overall severity is the max across factors — DEGRADED here
+    since both axes are DEGRADED-tier."""
+    factors = _eval_operational_state(
+        _op_inputs(_op_state_telemetry(
+            power_state=tel.POWER_STATE_MAINTENANCE,
+            health_state=tel.HEALTH_STATE_DEGRADED,
+        )),
+        _thr(),
+    )
+    factor_ids = {f.factor_id for f in factors}
+    assert factor_ids == {"operational.maintenance", "operational.degraded"}
+    assert all(f.severity == ls.LOGISTICS_SEVERITY_DEGRADED for f in factors)
+
+
+def test_operational_state_power_critical_plus_health_degraded():
+    """Cross-tier orthogonality: POWER_OFF (CRITICAL) + HEALTH_DEGRADED
+    (DEGRADED) both fire, max severity is CRITICAL."""
+    factors = _eval_operational_state(
+        _op_inputs(_op_state_telemetry(
+            power_state=tel.POWER_STATE_OFF,
+            health_state=tel.HEALTH_STATE_DEGRADED,
+        )),
+        _thr(),
+    )
+    factor_ids = {f.factor_id for f in factors}
+    assert factor_ids == {"operational.offline", "operational.degraded"}
+    sevs_by_id = {f.factor_id: f.severity for f in factors}
+    assert sevs_by_id["operational.offline"] == ls.LOGISTICS_SEVERITY_CRITICAL
+    assert sevs_by_id["operational.degraded"] == ls.LOGISTICS_SEVERITY_DEGRADED
+
+
+# -- Healthy / unset paths produce no factors -------------------------------
+
+def test_operational_state_power_on_health_nominal_no_factors():
+    """Per ADR-0026: POWER_ON + HEALTH_NOMINAL is the happy path, no
+    factors emitted. The asset reads as OK from this evaluator (severity
+    defaults to OK in _max_severity when factor list is empty)."""
+    factors = _eval_operational_state(
+        _op_inputs(_op_state_telemetry(
+            power_state=tel.POWER_STATE_ON,
+            health_state=tel.HEALTH_STATE_NOMINAL,
+        )),
+        _thr(),
+    )
+    assert factors == []
+
+
+def test_operational_state_standby_no_factors():
+    """POWER_STANDBY is "initialized, ready, no claim of activity" — not
+    a fault, no factor. Distinct from OFF (CRITICAL) and MAINTENANCE
+    (DEGRADED)."""
+    factors = _eval_operational_state(
+        _op_inputs(_op_state_telemetry(power_state=tel.POWER_STATE_STANDBY)),
+        _thr(),
+    )
+    assert factors == []
+
+
+def test_operational_state_all_unspecified_no_factors():
+    """No operational_state filled at all -> no factors (proto-default
+    UNSPECIFIED on every axis). This is the legacy-DIS / capability-only
+    case — schematic falls back to nominal-vs-degraded driven by other
+    factors (fuel, ammo, etc.) instead."""
+    factors = _eval_operational_state(
+        _op_inputs(_op_state_telemetry()),  # all axes default
+        _thr(),
+    )
+    assert factors == []
+
+
+# -- FunctionalMode is informational only -----------------------------------
+
+def test_operational_state_functional_mode_does_not_drive_severity():
+    """Per the proto comment + ADR-0026 + the rules.py implementation
+    comment: FunctionalMode is informational only. IDLE / ACTIVE /
+    RECEIVE_ONLY / TRANSMIT_ONLY / SCAN / TRACK are operator postures,
+    not faults, and must NOT contribute a ConstrainingFactor on their
+    own."""
+    for mode in (
+        tel.FUNCTIONAL_MODE_IDLE,
+        tel.FUNCTIONAL_MODE_ACTIVE,
+        tel.FUNCTIONAL_MODE_RECEIVE_ONLY,
+        tel.FUNCTIONAL_MODE_TRANSMIT_ONLY,
+        tel.FUNCTIONAL_MODE_SCAN,
+        tel.FUNCTIONAL_MODE_TRACK,
+    ):
+        factors = _eval_operational_state(
+            _op_inputs(_op_state_telemetry(functional_mode=mode)),
+            _thr(),
+        )
+        assert factors == [], (
+            f"FunctionalMode {tel.FunctionalMode.Name(mode)} unexpectedly produced "
+            f"a ConstrainingFactor — mode is informational only per ADR-0026."
+        )
+
+
+# -- Activity flags don't drive severity ------------------------------------
+
+def test_operational_state_activity_flags_dont_drive_severity():
+    """actively_receiving / actively_transmitting are discrete activity
+    cues for the SPA's activity-dot display. They never produce factors —
+    being inactive isn't a fault."""
+    factors = _eval_operational_state(
+        _op_inputs(_op_state_telemetry(
+            actively_receiving=False,
+            actively_transmitting=False,
+        )),
+        _thr(),
+    )
+    assert factors == []
+
+
+# -- Absent-telemetry guard -------------------------------------------------
+
+def test_operational_state_no_telemetry_returns_empty():
+    """Defensive: with latest_telemetry=None the evaluator must not
+    blow up reading op state from a non-existent message."""
+    inputs = FusionInputs(ASSET_ID, VARIANT,
+                          latest_telemetry=None,
+                          telemetry_windows=None,
+                          cm_state=None)
+    factors = _eval_operational_state(inputs, _thr())
+    assert factors == []
+
+
+# -- compute_logistics_status integration: op_state factors flow through ---
+
+def test_compute_status_picks_up_operational_state_factor():
+    """End-to-end (within rules.py): an op_state-only event with no
+    sustainment / cm / windows still produces an AssetLogisticsStatus
+    whose overall_severity reflects the op_state-derived factor."""
+    inputs = _op_inputs(_op_state_telemetry(
+        power_state=tel.POWER_STATE_MAINTENANCE,
+    ))
+    status = compute_logistics_status(inputs, _thr(), _now_ns())
+    assert status.overall_severity == ls.LOGISTICS_SEVERITY_DEGRADED
+    factor_ids = {f.factor_id for f in status.constraining_factors}
+    assert "operational.maintenance" in factor_ids
 
 
 # ---------------------------------------------------------------------------
