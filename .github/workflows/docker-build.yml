@@ -3,8 +3,12 @@ name: Docker Build
 on:
   push:
     branches: [ "master" ]
+    # Tag pushes (v1.0.0, ...) publish a versioned image (:v1.0.0)
+    # alongside :latest so consumers can pin to a release.
+    tags: [ "v*" ]
   pull_request:
     branches: [ "master" ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -33,10 +37,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Always publish :latest. On a v* tag push, ALSO publish the
+      # tag-versioned image so consumers can pin to a release.
+      - name: Compute image tags
+        id: tags
+        run: |
+          REG=ghcr.io/${{ github.repository_owner }}/openddil/logistics-fusion-service
+          T="$REG:latest"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            T="$T,$REG:${{ github.ref_name }}"
+          fi
+          echo "tags=$T" >> "$GITHUB_OUTPUT"
+
       - name: Build logistics-fusion-service
         uses: docker/build-push-action@v4
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/openddil/logistics-fusion-service:latest
+          tags: ${{ steps.tags.outputs.tags }}
