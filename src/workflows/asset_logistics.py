@@ -44,7 +44,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import restate
@@ -379,6 +380,29 @@ async def _recompute_and_maybe_emit(
     ctx.set(_KEY_LAST_SEVERITY, status.overall_severity)
     ctx.set(_KEY_REVISION, revision)
 
+    # Maintainer attention flow (2026-06-30): on TRANSITION into
+    # CRITICAL or NON_OPERATIONAL, emit a CloudEvent to tactical-events
+    # so the maintainer view's AlertFeed surfaces the change even if
+    # the operator's focus is on a different asset. The projector's
+    # tactical_events handler decodes JSON CloudEvents (not protobuf)
+    # and writes to the tactical_events table; ElectricSQL streams
+    # the row to the frontend, where AlertFeed renders cross-asset
+    # rows with a chevron + click-to-switch affordance. Only fires
+    # on the UPWARD transition into the alerting tiers -- a recovery
+    # transition out of CRITICAL doesn't need an alert (the posture
+    # pill and 3D tiles already reflect it). Initial emissions don't
+    # fire either; only confirmed transitions from a lower severity.
+    if is_transition and status.overall_severity in _ALERTING_SEVERITIES:
+        await _publish_tactical_event(
+            ctx,
+            asset_id=asset_id,
+            new_severity=status.overall_severity,
+            prev_severity=prev_sev or ls.LOGISTICS_SEVERITY_UNSPECIFIED,
+            revision=revision,
+            constraining_factors=list(status.constraining_factors),
+            origin=origin,
+        )
+
     logger.info(
         "Emitted %s for %s: %s -> %s (rev=%d, trigger=%s, factors=%d)",
         "initial" if is_initial else ("transition" if is_transition else "cadenced"),
@@ -386,6 +410,88 @@ async def _recompute_and_maybe_emit(
         _sev_name(prev_sev or ls.LOGISTICS_SEVERITY_UNSPECIFIED),
         _sev_name(status.overall_severity),
         revision, trigger, len(status.constraining_factors),
+    )
+
+
+# Severity tiers that warrant a maintainer-facing tactical event. Tracking
+# only the upward transitions (OK/UNSPECIFIED/DEGRADED -> CRITICAL or
+# NON_OPERATIONAL); recovery transitions are visible through the existing
+# asset-logistics-status path without needing an alert row.
+_ALERTING_SEVERITIES = frozenset({
+    ls.LOGISTICS_SEVERITY_CRITICAL,
+    ls.LOGISTICS_SEVERITY_NON_OPERATIONAL,
+})
+
+
+async def _publish_tactical_event(
+    ctx: restate.ObjectContext,
+    *,
+    asset_id: str,
+    new_severity: int,
+    prev_severity: int,
+    revision: int,
+    constraining_factors: list,
+    origin: dict,
+) -> None:
+    """Build + publish a JSON CloudEvent to the tactical-events topic.
+
+    Shape matches what the projector's tactical_events handler expects:
+    a top-level dict with `id`, `source`, `type`, `subject`, `time`,
+    `data` keys. `severity` is nested in `data` so the projector's
+    _extract_severity helper picks it up via the `severity` priority
+    key. Provenance (edge_id, region_id) is stamped into `data` too --
+    the handler reads them via resolve_provenance_from_top_level for
+    per-asset row attribution. Top constraining factor (if any) lands
+    in the description-ish slot so the AlertFeed row reads as
+    "logistics.transition --- thermal_overload_imminent" rather than
+    just "logistics.transition" with the operator wondering what
+    transitioned why.
+
+    The publish is wrapped in ctx.run so Restate journals it -- a
+    crash mid-publish replays into the same idempotent write. uuid4
+    for event_id; Restate replays cache the result on retry.
+    """
+    event_id = str(uuid.uuid4())
+    event_time = datetime.now(timezone.utc).isoformat()
+    top_factor = ""
+    if constraining_factors:
+        # Best-effort -- the proto has factor.code / factor.detail. Pick
+        # the first; severity-ordering already happened upstream.
+        f = constraining_factors[0]
+        top_factor = getattr(f, "code", "") or getattr(f, "factor_code", "") or ""
+
+    sev_name = _sev_name(new_severity)
+    prev_sev_name = _sev_name(prev_severity)
+
+    envelope: dict[str, Any] = {
+        "specversion": "1.0",
+        "id": event_id,
+        "source": "openddil/logistics-fusion-service",
+        "type": "openddil.logistics.v1.severity-transition",
+        "subject": asset_id,
+        "time": event_time,
+        "datacontenttype": "application/json",
+        "data": {
+            "severity": sev_name,
+            "previous_severity": prev_sev_name,
+            "status_revision": revision,
+            "top_factor": top_factor,
+            "edge_id": origin.get("edge_id", ""),
+            "region_id": origin.get("region_id", ""),
+        },
+    }
+    payload = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+    await ctx.run(
+        "publish-tactical-event",
+        lambda: _publish_kafka(
+            topic="tactical-events",
+            key=asset_id,
+            value=payload,
+        ),
+    )
+    logger.info(
+        "Tactical event emitted for %s: %s -> %s (rev=%d, factor=%s)",
+        asset_id, prev_sev_name, sev_name, revision, top_factor or "<none>",
     )
 
 
