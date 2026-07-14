@@ -21,8 +21,9 @@ Inputs (delivered by Restate Kafka subscriptions):
     - Phase 5 prognostics engine; wear values stamped ORIGIN_DERIVED
   on_capability_snapshot(AssetCapabilitySnapshot-JSON)
     - source topic: asset-capability-snapshot
-    - customer-overlay StrikeCapabilityMessage feed; drives the
-      engagement-worthiness evaluator (Sub-phase F)
+    - weapons-capability feed (source-specific messages decomposed
+      into the canonical shape at ingress); drives the engagement-
+      worthiness evaluator (Sub-phase F)
   on_timer()
     - scheduled callback, fires every EMIT_INTERVAL_SECONDS
 
@@ -148,9 +149,10 @@ _KEY_TELEMETRY = "latest_telemetry_dict"
 _KEY_DERIVED_TELEMETRY = "latest_derived_telemetry_dict"
 _KEY_WINDOWS = "latest_windows_dict"
 _KEY_CM_STATE = "cm_state_dict"
-# Sub-phase F: latest customer-overlay capability snapshot for this asset
-# (the StrikeCapabilityMessage feed, Silver topic asset-capability-snapshot).
-# Drives the engagement-worthiness evaluator (`_eval_inventory`).
+# Sub-phase F: latest weapons-capability snapshot for this asset
+# (Silver topic asset-capability-snapshot, decomposed from a source-
+# specific producer at ingress). Drives the engagement-worthiness
+# evaluator (`_eval_inventory`).
 _KEY_CAPABILITY = "latest_capability_dict"
 _KEY_LAST_SEVERITY = "last_emitted_severity"
 _KEY_REVISION = "status_revision"
@@ -261,10 +263,10 @@ async def on_derived_sustainment(ctx: restate.ObjectContext, raw: bytes) -> None
     input_serde=restate.serde.BytesSerde(),
 )
 async def on_capability_snapshot(ctx: restate.ObjectContext, raw: bytes) -> None:
-    """Consume a customer-overlay capability snapshot (Sub-phase F).
+    """Consume a weapons-capability snapshot (Sub-phase F).
 
-    Source topic: `asset-capability-snapshot` (Silver, JSON). The customer
-    StrikeCapabilityMessage feed lands here via the customer-overlay connect
+    Source topic: `asset-capability-snapshot` (Silver, JSON). Source-
+    specific weapons-capability feeds land here via their respective connect
     overlay; each message is the current per-store Ammo state for one
     asset. Drives the engagement-worthiness evaluator (`_eval_inventory`)
     — `AMMO_LOW` / `AMMO_EXHAUSTED` ConstrainingFactors carried on the
@@ -574,8 +576,8 @@ def _decode_cm_state(raw: bytes | dict | None) -> dict:
 
 
 def _decode_capability_snapshot(raw: bytes | dict | None) -> dict:
-    """asset-capability-snapshot is a plain-JSON Silver shape — the customer
-    StrikeCapabilityMessage Bloblang produces JSON, not proto. No proto
+    """asset-capability-snapshot is a plain-JSON Silver shape — the
+    source-specific weapons-capability Bloblang produces JSON, not proto. No proto
     fallback (unlike cm-state): this topic is JSON-only by contract."""
     if isinstance(raw, dict):
         return raw

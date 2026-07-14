@@ -354,9 +354,10 @@ def _eval_wear(inputs: FusionInputs,
 
 def _eval_inventory(inputs: FusionInputs,
                      thresholds: Thresholds) -> list[ls.ConstrainingFactor]:
-    """Engagement-worthiness from the customer capability snapshot.
+    """Engagement-worthiness from the weapons-capability snapshot.
 
-    Sub-phase F. The customer's StrikeCapabilityMessage feed (Silver topic
+    Sub-phase F. The weapons-capability feed (source-specific messages
+    decomposed by their respective Bloblang into the Silver topic
     `asset-capability-snapshot`) carries the current Ammo count for every
     loaded store on an asset. A store at zero Ammo cannot engage
     (AMMO_EXHAUSTED → CRITICAL); a store running low is a DEGRADED warning
@@ -610,8 +611,8 @@ def _eval_staleness(inputs: FusionInputs,
                      now_ns: int) -> ls.ConstrainingFactor | None:
     if inputs.latest_telemetry is None:
         # A capability-only asset (customer overlay — no DIS / sustainment
-        # telemetry, only the StrikeCapabilityMessage feed) IS being
-        # observed; the capability snapshot is its input. Don't false-flag
+        # telemetry, only the weapons-capability feed) IS being observed;
+        # the capability snapshot is its input. Don't false-flag
         # it "no telemetry". Staleness of the capability feed itself is out
         # of Sub-phase F scope.
         if inputs.capability_snapshot:

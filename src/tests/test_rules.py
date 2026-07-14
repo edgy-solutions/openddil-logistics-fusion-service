@@ -146,9 +146,9 @@ def _store(capability_id: str, ammo: int, *, store_location: int = 1,
 
 
 def _capability_snapshot(*stores: dict) -> dict:
-    """The asset-capability-snapshot Silver shape (JSON) produced by the
-    customer-overlay strike-capability Bloblang. Only the fields `_eval_inventory`
-    reads are required."""
+    """The asset-capability-snapshot Silver shape (JSON) produced by any
+    source-specific weapons-capability Bloblang. Only the fields
+    `_eval_inventory` reads are required."""
     return {
         "schema_revision": 1,
         "asset_id": ASSET_ID,
