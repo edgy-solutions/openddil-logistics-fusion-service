@@ -584,13 +584,37 @@ def _eval_cm_state(inputs: FusionInputs,
     # Values come from openddil.configuration.v1.ConfigurationStatus.
     # Re-derive numeric values via enum lookup so a renumbering in the proto
     # surfaces here rather than silently mis-mapping.
+    #
+    # 2026-07-14: CM contribution CAPPED at DEGRADED per ADR-0026 (CM and
+    # operational state are orthogonal axes; a records-compliance judgment
+    # must not dominate a rollup that also carries functional severity).
+    # Previously CONFIG_STATUS_NOT_MISSION_CAPABLE mapped to
+    # LOGISTICS_SEVERITY_NON_OPERATIONAL, and because overall_severity is
+    # a strict worst-of across all factors, a CM-only red asset with all
+    # operational factors green would still render NON_OPERATIONAL to
+    # every consumer (map ring, LogisticsStatusCard badge, regional/HQ
+    # rollups). Stakeholders correctly read that as an incoherent
+    # display: functionally-up radar labeled cannot-perform-mission.
+    #
+    # A CM deviation on a functioning asset IS a real degradation of the
+    # logistics posture (operating with deferred maintenance risk) but
+    # it is not "cannot perform mission" territory. Cap at DEGRADED so
+    # the factor still surfaces as a ConstrainingFactor in the drill-in
+    # (visibility preserved) and still contributes to overall_severity
+    # via worst-of, but never solo-drives it past DEGRADED.
+    #
+    # A CM state that ever genuinely means "do not operate this asset"
+    # (safety-of-use notice, grounding directive) is a distinct input
+    # and would arrive as its own factor, not through this mapping. See
+    # follow-up: explicit OPERATING_WITH_CM_WAIVER enum (B4) for the
+    # first-class rendering of the CM-red/ops-green quadrant.
     cs = inputs.cm_state.DESCRIPTOR.fields_by_name["overall_status"].enum_type
     name_to_sev: dict[str, int | None] = {
         "CONFIG_STATUS_UNSPECIFIED":          None,
         "CONFIG_STATUS_IN_COMPLIANCE":        None,
         "CONFIG_STATUS_MINOR_DISCREPANCY":    None,  # advisory; not a constraint
         "CONFIG_STATUS_MAJOR_DISCREPANCY":    ls.LOGISTICS_SEVERITY_DEGRADED,
-        "CONFIG_STATUS_NOT_MISSION_CAPABLE":  ls.LOGISTICS_SEVERITY_NON_OPERATIONAL,
+        "CONFIG_STATUS_NOT_MISSION_CAPABLE":  ls.LOGISTICS_SEVERITY_DEGRADED,
     }
     try:
         status_name = cs.values_by_number[overall].name

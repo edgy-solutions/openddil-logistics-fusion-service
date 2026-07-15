@@ -815,14 +815,22 @@ def test_compute_status_picks_up_operational_state_factor():
 # ---------------------------------------------------------------------------
 # CM state evaluator
 # ---------------------------------------------------------------------------
-def test_cm_not_mission_capable_is_non_operational():
+def test_cm_not_mission_capable_capped_at_degraded():
+    # ADR-0026: CM and operational state are orthogonal axes. Fusion
+    # must not fold CM state into a severity that dominates a rollup
+    # also carrying functional signal. NOT_MISSION_CAPABLE is capped
+    # at DEGRADED (same as MAJOR_DISCREPANCY) so a CM-only failure on
+    # a functionally-green asset never renders NON_OPERATIONAL to
+    # downstream consumers. The factor is still emitted so the CM
+    # constraint remains visible in drill-in views.
     factor = _eval_cm_state(
         FusionInputs(ASSET_ID, VARIANT, None, None,
                       _cm_state(status_name="CONFIG_STATUS_NOT_MISSION_CAPABLE")),
         _thr(),
     )
     assert factor is not None
-    assert factor.severity == ls.LOGISTICS_SEVERITY_NON_OPERATIONAL
+    assert factor.severity == ls.LOGISTICS_SEVERITY_DEGRADED
+    assert factor.factor_id == "cm.overall_status"
 
 
 def test_cm_major_discrepancy_is_degraded():
@@ -932,7 +940,14 @@ def test_one_red_among_ambers_overall_critical():
     assert status.projected_mission_capable_remaining.seconds == 0
 
 
-def test_cm_not_mission_capable_dominates():
+def test_cm_not_mission_capable_does_not_dominate_functional_green():
+    # ADR-0026 compliance: a CM-only failure on a functionally-green
+    # asset must NOT drag overall_severity past DEGRADED. Previously
+    # this test asserted the opposite (worst-of pulled overall to
+    # NON_OPERATIONAL solely from CM); that behavior violated the
+    # orthogonality declared in ADR-0026 and produced the confusing
+    # "functionally-green radar labeled cannot-perform-mission"
+    # rendering that stakeholders correctly flagged.
     inputs = FusionInputs(
         asset_id=ASSET_ID,
         platform_variant=VARIANT,
@@ -941,7 +956,10 @@ def test_cm_not_mission_capable_dominates():
         cm_state=_cm_state(status_name="CONFIG_STATUS_NOT_MISSION_CAPABLE"),
     )
     status = compute_logistics_status(inputs, _thr(), _now_ns())
-    assert status.overall_severity == ls.LOGISTICS_SEVERITY_NON_OPERATIONAL
+    assert status.overall_severity == ls.LOGISTICS_SEVERITY_DEGRADED
+    # The CM factor is still emitted -- drill-in visibility preserved.
+    factor_ids = {f.factor_id for f in status.constraining_factors}
+    assert "cm.overall_status" in factor_ids
 
 
 def test_completely_empty_inputs_get_staleness_factor():
