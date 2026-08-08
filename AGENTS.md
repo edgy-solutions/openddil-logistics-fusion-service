@@ -94,6 +94,21 @@ should report:
 contracts repo's ontology dir so tests find `platform_reference.yaml`
 without needing the container `/ontology` mount.
 
+## Running from source — respect the dependency pins
+
+Prefer running this service **from its image**. If you must run it from
+source, install against the pins in `pyproject.toml`, not by name.
+
+The one that bites: `cloudevents` is pinned `>=1.10.0,<2.0.0`. A bare
+`pip install cloudevents` resolves to **2.x**, which does **not** provide
+`cloudevents.conversion` — the import fails at startup with
+`ModuleNotFoundError: No module named 'cloudevents.conversion'`, which
+reads like a missing package rather than a wrong major version. Cost an
+hour of harness debugging once; costs nothing to avoid.
+
+Same caution applies to the sibling Restate service (`cm-service`), which
+carries the same pin.
+
 ## Documentation Maintenance
 
 After ANY structural change, update:
