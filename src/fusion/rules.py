@@ -414,6 +414,28 @@ def _eval_inventory(inputs: FusionInputs,
     return factors
 
 
+# Confidence for the mtbf projection. ASSERTED, NOT COMPUTED — and the
+# distinction is the point, because a computed-looking number here would be
+# the confabulation shape: a real-seeming answer where a refusal or an
+# honest assertion belongs.
+#
+# There is no computation available today. Linear extrapolation of a single
+# trend line carries no intrinsic uncertainty estimate, and the wear
+# accumulators keep (mean, count) — sufficient to merge a mean across tiers,
+# insufficient for dispersion. So there is nothing to derive a fit quality
+# from even in principle.
+#
+# Low because the projection sits on ADR-0020's authored placeholder
+# coefficients, which are explicitly unvalidated. The value is a floor on
+# trust, not a measurement of it.
+#
+# See ADR-0020 §Confidence staircase for the path to a real number, and the
+# rule that a computed confidence must declare its KIND alongside its value —
+# fit quality and calibrated probability are different quantities and must
+# never share this field silently.
+_MTBF_ASSERTED_CONFIDENCE = 0.2
+
+
 def _eval_mtbf(inputs: FusionInputs,
                 thresholds: Thresholds) -> ls.ConstrainingFactor | None:
     """Soonest projected component failure from windowed RUL slopes.
@@ -466,6 +488,21 @@ def _eval_mtbf(inputs: FusionInputs,
         current_value=_ucum_quantity(soonest_h, "h"),
         threshold=_ucum_quantity(threshold, "h"),
         projected_time_to_worse=_duration_from_hours(soonest_h),
+        # ADR-0035 IH-5. This is the most-derived value the engine produces —
+        # a projection built on an extrapolation of authored coefficients —
+        # and until this stamp it was the ONLY factor claiming nothing about
+        # its own origin, while less-derived siblings (_eval_inventory, the
+        # derived-sustainment evaluator) stamped correctly. The provenance
+        # discipline had landed everywhere except its most load-bearing
+        # point, and proto3's honest zero-defaults are what made that
+        # invisible.
+        #
+        # Consumers read `origin` to decide whether a value needs a
+        # modelled-not-measured treatment on screen (ADR-0035 class 1), so
+        # this stamp is what makes an honest render possible at all — the
+        # alternative is hardcoding the marker per field.
+        origin=tel.ORIGIN_DERIVED,
+        confidence=_MTBF_ASSERTED_CONFIDENCE,
     )
 
 

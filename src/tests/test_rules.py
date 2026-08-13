@@ -487,6 +487,33 @@ def test_mtbf_critical_from_negative_slope():
     assert factor.factor_id == "mtbf.transmission"
 
 
+def test_mtbf_factor_stamps_derived_provenance():
+    """ADR-0035 IH-5. The mtbf projection is the most-derived value the
+    engine produces and must say so: a projection built on an extrapolation
+    of authored coefficients.
+
+    This guard was run RED against the unstamped evaluator before being
+    trusted (ADR-0037 §3) — it fails with ORIGIN_UNSPECIFIED / 0.0, which is
+    exactly the state it exists to prevent recurring.
+
+    `origin` is asserted by identity, not by truthiness: ORIGIN_UNSPECIFIED
+    is 0, so `assert factor.origin` would pass for ORIGIN_MEASURED and fail
+    open on the case that matters.
+    """
+    factor = _eval_mtbf(
+        FusionInputs(ASSET_ID, VARIANT, None,
+                      _windows(wear_trends=[("engine", 6.0, -1.0)]),
+                      None),
+        _thr(),
+    )
+    assert factor is not None
+    assert factor.origin == tel.ORIGIN_DERIVED
+    # Asserted, not computed — see rules._MTBF_ASSERTED_CONFIDENCE. Pinned
+    # as a non-zero low value: 0.0 was the pre-IH-5 state and reads as "no
+    # claim", which is the thing being corrected.
+    assert 0.0 < factor.confidence < 0.5
+
+
 def test_mtbf_degraded_from_slow_decline():
     """RUL dropping at -1 h/h, latest 6 h → 6 h to failure (degraded)."""
     factor = _eval_mtbf(
