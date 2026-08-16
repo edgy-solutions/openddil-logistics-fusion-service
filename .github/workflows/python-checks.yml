@@ -1,0 +1,137 @@
+name: Python checks
+
+# VE-8. Until 2026-08-15 NO CI JOB RAN ANY PYTHON TEST SUITE in this repo or
+# its two siblings — the only workflow was build-and-publish, and the
+# Dockerfile has no test stage. That is not "tests were failing"; it is no
+# signal at all, which is why a suite that could not even COLLECT went
+# unnoticed for over two months (ADR-0037, §Named limits).
+#
+# Shape mirrors openddil-demo's frontend-checks.yml deliberately — the fix is
+# a copy, not a design.
+#
+# TWO REQUIREMENTS THIS ADDS ON TOP OF "RUN PYTEST":
+#
+#   1. THE PASS COUNT IS PART OF THE RESULT. "tests pass" is equally true of
+#      zero tests; "63 passed" is evidence. The count is written to the job
+#      summary where it is visible without opening logs.
+#
+#   2. A RUN PRODUCES A DURABLE ARTIFACT (VE-2). Console output is a
+#      transient — it cannot be re-read or cited by a later claim. This job
+#      uploads a JUnit XML (per-test outcome, duration, skip reason) plus a
+#      versions file, so "the suite passed on <date>" points at something.
+#
+# The suite needs the generated protobuf bindings, which are NOT an installed
+# package — they live in the sibling openddil-contracts repo and the tests
+# resolve them by relative path. So this workflow reproduces the WORKSPACE
+# LAYOUT, not just this repo. Getting that wrong reproduces the exact
+# collection failure the job exists to catch.
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/python-checks.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/python-checks.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Checked out under a directory named for the repo, with contracts as a
+      # SIBLING, because src/tests/conftest.py resolves the gen path as
+      # parents[3]/"openddil-contracts"/"gen"/"python".
+      - name: Checkout service
+        uses: actions/checkout@v4
+        with:
+          path: openddil-logistics-fusion-service
+
+      - name: Checkout contracts (sibling — supplies gen/python)
+        uses: actions/checkout@v4
+        with:
+          repository: edgy-solutions/openddil-contracts
+          path: openddil-contracts
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        working-directory: openddil-logistics-fusion-service
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . || pip install .
+          pip install pytest pytest-cov pytest-asyncio
+
+      # Recorded BEFORE the suite so the artifact is useful even on failure —
+      # "which versions was this run against" is the first question asked of
+      # a red run, and the second of a green one.
+      - name: Record environment
+        working-directory: openddil-logistics-fusion-service
+        run: |
+          mkdir -p test-results
+          {
+            echo "date_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "commit: ${GITHUB_SHA}"
+            echo "python: $(python -V 2>&1)"
+            echo "pytest: $(python -m pytest --version 2>&1 | head -1)"
+            echo "--- packages ---"
+            pip freeze
+          } > test-results/environment.txt
+
+      # --junitxml is the durable record: per-test outcome, duration, and
+      # skip reason, in a format that is still readable without this workflow.
+      - name: Run suite
+        working-directory: openddil-logistics-fusion-service
+        run: |
+          set -o pipefail
+          python -m pytest -q \
+            --junitxml=test-results/junit.xml \
+            | tee test-results/pytest-stdout.txt
+
+      # Runs on failure too — a red run's artifact is the more useful one.
+      - name: Summarise (pass count, not exit code)
+        if: always()
+        working-directory: openddil-logistics-fusion-service
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import xml.etree.ElementTree as ET, pathlib, sys
+          p = pathlib.Path("test-results/junit.xml")
+          if not p.exists():
+              print("## Python checks\n")
+              print("**No JUnit XML produced — the suite did not run.**\n")
+              print("A collection error aborts pytest before any test "
+                    "executes, so this is the absence of a run, not a set "
+                    "of failures.")
+              sys.exit(0)
+          s = ET.parse(p).getroot()
+          s = s.find("testsuite") if s.tag == "testsuites" else s
+          g = lambda k: int(s.get(k, 0))
+          total, fail, err, skip = g("tests"), g("failures"), g("errors"), g("skipped")
+          print("## Python checks\n")
+          print(f"**{total - fail - err - skip} passed**, {fail} failed, "
+                f"{err} errors, {skip} skipped — of {total} collected "
+                f"in {s.get('time','?')}s\n")
+          if total == 0:
+              print("> Zero tests collected. A green exit code here would mean nothing.")
+          for case in s.iter("testcase"):
+              bad = case.find("failure") if case.find("failure") is not None else case.find("error")
+              if bad is not None:
+                  print(f"- `{case.get('classname')}::{case.get('name')}` — "
+                        f"{(bad.get('message') or '').splitlines()[0][:160]}")
+          PY
+
+      - name: Upload run record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-test-record
+          path: openddil-logistics-fusion-service/test-results/
+          retention-days: 30
