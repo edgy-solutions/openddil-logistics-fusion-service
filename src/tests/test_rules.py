@@ -8,6 +8,8 @@ Target: ≥90% coverage on fusion/rules.py.
 """
 from __future__ import annotations
 
+import logging
+
 import time
 
 import pytest
@@ -586,6 +588,62 @@ def test_subsystem_token_without_colon_handled():
     )
     assert len(factors) == 1
     assert factors[0].factor_id == "subsystem.unknown"
+
+
+def test_subsystem_unknown_health_warns_and_dedupes(caplog):
+    """The skip is correct; the SILENCE was not.
+
+    An unmapped fault code is still discarded — that is deliberate, since an
+    unrecognised string does not constrain the asset. But the asset DID
+    report something, and before this the discard left no trace anywhere:
+    no factor, no log, nothing to distinguish it from a producer that said
+    nothing at all.
+
+    Both halves are asserted because both are load-bearing (ADR-0036
+    clause 1): WARNING level, because a signal suppressed at the default
+    level is not a signal; and deduplicated, because fault codes arrive per
+    message and an unmapped one would otherwise log at feed rate until
+    someone filters it.
+    """
+    import fusion.rules as R
+    R._warned_unmapped.clear()   # module singleton — do not inherit state
+
+    with caplog.at_level(logging.WARNING, logger="fusion.rules"):
+        for _ in range(3):
+            factors = _eval_subsystems(
+                FusionInputs(ASSET_ID, VARIANT,
+                              _telemetry(faults=["POWERPLANT:THERMAL_LIMITED"]),
+                              None, None),
+                _thr(),
+            )
+
+    # Behaviour is unchanged: still discarded, still no factor.
+    assert factors == []
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"expected exactly one warning, got {len(warnings)}"
+    msg = warnings[0].getMessage()
+    assert "THERMAL_LIMITED" in msg          # names the value it could not map
+    assert "DISCARDED" in msg                # says what happened to it
+    assert "subsystem_health_map" in msg     # names the fix, not just the symptom
+
+
+def test_subsystem_mapped_health_does_not_warn(caplog):
+    """A recognised code must stay silent — otherwise the warning is noise
+    and gets filtered, which is the failure mode it was written to avoid."""
+    import fusion.rules as R
+    R._warned_unmapped.clear()
+
+    with caplog.at_level(logging.WARNING, logger="fusion.rules"):
+        factors = _eval_subsystems(
+            FusionInputs(ASSET_ID, VARIANT,
+                          _telemetry(faults=["POWERPLANT:DEGRADED"]),
+                          None, None),
+            _thr(),
+        )
+
+    assert len(factors) == 1
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
 # ---------------------------------------------------------------------------

@@ -158,6 +158,38 @@ def _duration_from_hours(hours: float) -> duration_pb2.Duration:
     return d
 
 
+# ---------------------------------------------------------------------------
+# Deduplicated warning for discarded input (ADR-0036 clause 1)
+# ---------------------------------------------------------------------------
+_warned_unmapped: set[str] = set()
+
+
+def _warn_unmapped_once(kind: str, value: str, hint: str) -> None:
+    """Warn ONCE per distinct unrecognised value, at WARNING.
+
+    Both properties are load-bearing, and both come from clause 1:
+
+    * WARNING, not DEBUG — a signal suppressed at the default level is not
+      a signal. That is how the buffer probe stayed invisible for months.
+    * Deduplicated — these arrive per telemetry message, so an unmapped
+      value would log at feed rate and be filtered within a day, which
+      trains readers to ignore it exactly as a permanent zero trained them
+      to trust it.
+
+    The message names the likely cause rather than the symptom, so the log
+    line is a diagnosis: someone reading it should not have to open this
+    file to learn what to do.
+    """
+    key = f"{kind}:{value}"
+    if key in _warned_unmapped:
+        return
+    _warned_unmapped.add(key)
+    logger.warning(
+        "Unrecognised %s %r — DISCARDED, contributes nothing to severity. %s",
+        kind, value, hint,
+    )
+
+
 def _max_severity(factors: Iterable[ls.ConstrainingFactor]) -> int:
     items = list(factors)
     if not items:
@@ -521,6 +553,18 @@ def _eval_subsystems(inputs: FusionInputs,
         sev = thresholds.subsystem_health_map.get(
             health.strip().upper(), ls.LOGISTICS_SEVERITY_UNSPECIFIED,
         )
+        # UNSPECIFIED and OK arrive here together and mean different things:
+        # "we do not recognise this string" versus "this subsystem is fine".
+        # Both are skipped — that is deliberate, since neither constrains the
+        # asset — but only the first is a DISCARD, and a discard that leaves
+        # no trace is indistinguishable from a producer that said nothing.
+        # The asset DID report a fault code; we simply had no mapping for it.
+        if sev == ls.LOGISTICS_SEVERITY_UNSPECIFIED:
+            _warn_unmapped_once(
+                "subsystem health", health.strip(),
+                f"Add it to subsystem_health_map (subsystem={subsys.strip()!r}) "
+                "or confirm with the producer that this vocabulary is expected.",
+            )
         if sev in (ls.LOGISTICS_SEVERITY_UNSPECIFIED,
                     ls.LOGISTICS_SEVERITY_OK):
             continue
