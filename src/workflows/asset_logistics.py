@@ -109,6 +109,47 @@ def _extract_origin(event_dict: dict | None) -> tuple[str, str]:
     return edge, region
 
 
+def _extract_releasability(event_dict: dict | None) -> tuple[str, list[str]]:
+    """Pull ADR-0029 releasability labels from any of the four inbound shapes.
+
+    Deliberately mirrors _extract_origin above, including the cm-state
+    top-level case and the camelCase/snake_case ambiguity that comes from
+    two different MessageToDict settings being live in this system. Written
+    as a sibling rather than folded into _extract_origin because the two
+    answer different questions and one of them is allowed to be absent
+    routinely — origin falls back to an env default, a MISSING LABEL MUST
+    NOT.
+
+    Returns ("", []) when the event carries no label. Empty nation is the
+    unlabelled signal; an empty releasable_to list beside a real nation is a
+    legitimate and common posture, not an absence."""
+    if not event_dict:
+        return "", []
+    # cm-state envelope: top-level snake_case (ADR-0018 JSON shape).
+    top = event_dict.get("originator_nation")
+    if top:
+        return top, list(event_dict.get("releasable_to") or [])
+    prov = event_dict.get("provenance") or {}
+    nation = prov.get("originatorNation") or prov.get("originator_nation") or ""
+    releasable = prov.get("releasableTo") or prov.get("releasable_to") or []
+    return nation, list(releasable)
+
+
+async def _refresh_releasability(ctx, event_dict: dict | None) -> None:
+    """Store the asset's labels so emissions from on_timer — which have no
+    fresh inbound event — still carry them.
+
+    THE STICKY BEHAVIOUR IS DELIBERATE AND IS THE SAME CHOICE _refresh_origin
+    MADE: once an asset's nation is known, a later event that omits it does
+    not clear it. An asset does not change nationality because one message
+    was thin, and clearing on absence would make the completeness gate
+    flicker with feed hiccups. Relabelling requires a positive statement."""
+    nation, releasable = _extract_releasability(event_dict)
+    if nation:
+        ctx.set(_KEY_RELEASABILITY,
+                {"originator_nation": nation, "releasable_to": releasable})
+
+
 async def _refresh_origin(ctx, event_dict: dict | None) -> None:
     """Update the per-asset _KEY_ORIGIN from the inbound event. Stored so
     emissions from on_timer (no fresh inbound event) inherit the asset's
@@ -120,6 +161,20 @@ async def _refresh_origin(ctx, event_dict: dict | None) -> None:
             "edge_id":   edge_id or existing.get("edge_id", ""),
             "region_id": region_id or existing.get("region_id", ""),
         })
+
+
+async def _refresh_provenance(ctx, event_dict: dict | None) -> None:
+    """Refresh EVERYTHING an emission inherits from an inbound event.
+
+    Exists so there is exactly ONE call to add at an inbound handler, not a
+    pair that must be kept together. There are five inbound shapes; a second
+    call site that someone forgets to add beside the first would mean labels
+    never propagate for assets that only ever arrive on that path — and the
+    symptom would be a §7 gate failure attributed to ingress rather than to
+    the handler that dropped the label. Cheap to prevent, expensive to
+    diagnose."""
+    await _refresh_origin(ctx, event_dict)
+    await _refresh_releasability(ctx, event_dict)
 
 
 _publish_kafka_fn = None
@@ -139,6 +194,11 @@ def _publish_kafka(*, topic: str, key: str, value: bytes) -> None:
 
 # Restate state keys
 _KEY_ORIGIN = "origin_node"
+# ADR-0029 §3. Held per-asset for the same reason as _KEY_ORIGIN: a derived
+# row emitted on a timer has no inbound event to read labels from, and a
+# derived row without labels is a leak by omission — the severity of an asset
+# is as national as the asset.
+_KEY_RELEASABILITY = "releasability"
 _KEY_TELEMETRY = "latest_telemetry_dict"
 # Phase 5 step 2: latest derived-sustainment event for this asset. Separate
 # from `_KEY_TELEMETRY` so the measured/derived merge stays explicit:
@@ -179,7 +239,7 @@ async def on_telemetry_window(ctx: restate.ObjectContext, raw: bytes) -> None:
         return
 
     ctx.set(_KEY_WINDOWS, record_dict)
-    await _refresh_origin(ctx, record_dict)
+    await _refresh_provenance(ctx, record_dict)
     await _recompute_and_maybe_emit(ctx, asset_id, trigger="windowed_telemetry")
     await _schedule_next_timer(ctx, asset_id)
 
@@ -198,7 +258,7 @@ async def on_cm_state_change(ctx: restate.ObjectContext, raw: bytes) -> None:
         return
 
     ctx.set(_KEY_CM_STATE, state_dict)
-    await _refresh_origin(ctx, state_dict)
+    await _refresh_provenance(ctx, state_dict)
     await _recompute_and_maybe_emit(ctx, asset_id, trigger="cm_state_change")
     await _schedule_next_timer(ctx, asset_id)
 
@@ -223,7 +283,7 @@ async def on_proprietary_update(ctx: restate.ObjectContext, raw: bytes) -> None:
         return
 
     ctx.set(_KEY_TELEMETRY, record_dict)
-    await _refresh_origin(ctx, record_dict)
+    await _refresh_provenance(ctx, record_dict)
     await _recompute_and_maybe_emit(ctx, asset_id, trigger="telemetry")
     await _schedule_next_timer(ctx, asset_id)
 
@@ -252,7 +312,7 @@ async def on_derived_sustainment(ctx: restate.ObjectContext, raw: bytes) -> None
         return
 
     ctx.set(_KEY_DERIVED_TELEMETRY, record_dict)
-    await _refresh_origin(ctx, record_dict)
+    await _refresh_provenance(ctx, record_dict)
     await _recompute_and_maybe_emit(ctx, asset_id, trigger="derived_sustainment")
     await _schedule_next_timer(ctx, asset_id)
 
@@ -281,7 +341,7 @@ async def on_capability_snapshot(ctx: restate.ObjectContext, raw: bytes) -> None
         return
 
     ctx.set(_KEY_CAPABILITY, snapshot)
-    await _refresh_origin(ctx, snapshot)
+    await _refresh_provenance(ctx, snapshot)
     await _recompute_and_maybe_emit(ctx, asset_id, trigger="capability_snapshot")
     await _schedule_next_timer(ctx, asset_id)
 
@@ -370,6 +430,22 @@ async def _recompute_and_maybe_emit(
     if origin.get("region_id"):
         update.provenance.region_id = origin["region_id"]
     update.provenance.producer_id = "logistics-fusion-service"
+
+    # ADR-0029 §3: PROPAGATE, do not derive. Fusion has no releasability
+    # declaration and must never acquire one — the label is stamped once at
+    # ingress and carried. What fusion contributes is the join: it knows
+    # which asset this derived row is about, so it knows which labels the row
+    # inherits.
+    #
+    # No else-branch and no default. An asset whose telemetry never carried a
+    # label emits a derived row with no label, which the §7 gate then counts.
+    # That is the correct outcome: the fix belongs at the ingress that failed
+    # to declare the asset, not here, and inventing a value here would hide
+    # the very thing the gate exists to surface.
+    rel = await ctx.get(_KEY_RELEASABILITY, type_hint=dict) or {}
+    if rel.get("originator_nation"):
+        update.provenance.originator_nation = rel["originator_nation"]
+        update.provenance.releasable_to.extend(rel.get("releasable_to") or [])
 
     await ctx.run(
         "publish-asset-logistics-status",
