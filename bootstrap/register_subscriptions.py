@@ -17,6 +17,8 @@ import time
 from openddil_bootstrap.restate_subscriptions import (
     Subscription,
     bootstrap_restate_service,
+    group_prefix_owner,
+    prune_subscriptions,
 )
 
 logger = logging.getLogger("logistics.bootstrap")
@@ -119,6 +121,7 @@ def main() -> int:
                 "(inter-cluster sleep=%.1fs)",
                 len(edge_clusters), inter_cluster_sleep)
 
+    desired: list[tuple[str, Subscription]] = []
     for i, (edge_id, brokers) in enumerate(edge_clusters):
         if i > 0 and inter_cluster_sleep > 0:
             time.sleep(inter_cluster_sleep)
@@ -132,6 +135,8 @@ def main() -> int:
             subscriptions=_per_edge_subscriptions(edge_id),
             timeout_s=BOOTSTRAP_TIMEOUT_S,
         )
+        desired.extend((cluster_name, sub)
+                        for sub in _per_edge_subscriptions(edge_id))
 
     if inter_cluster_sleep > 0:
         time.sleep(inter_cluster_sleep)
@@ -143,6 +148,27 @@ def main() -> int:
         kafka_brokers=HQ_BROKERS,
         subscriptions=_hq_subscriptions(),
         timeout_s=BOOTSTRAP_TIMEOUT_S,
+    )
+    # The HQ subscriptions belong in the desired set too -- they share the
+    # `fusion-service-` ownership prefix, so omitting them here would have
+    # the prune below delete the very subscription that carries a
+    # tier-managed edge's CM state INTO the root. The completeness of this
+    # list is what makes pruning safe, and `fusion-service-cm-state-hq` is
+    # the entry whose absence would be quietest.
+    desired.extend(("openddil-hq", sub) for sub in _hq_subscriptions())
+
+    # ------------------------------------------------------------------
+    # PRUNE (UD-12). See the companion comment in cm-service's bootstrap:
+    # registration can only ADD, so a subscription retired from
+    # FUSION_EDGE_CLUSTERS survived every upgrade except by way of
+    # `hook-restate-wipe` deleting the PVC -- which is off in exactly the
+    # prod-like configuration where it matters.
+    # ------------------------------------------------------------------
+    prune_subscriptions(
+        restate_admin_url=RESTATE_ADMIN_URL,
+        desired=desired,
+        owns=group_prefix_owner("fusion-service-"),
+        scope_label="logistics-fusion-service",
     )
 
     return 0
