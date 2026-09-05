@@ -25,6 +25,16 @@ name: Python checks
 # resolve them by relative path. So this workflow reproduces the WORKSPACE
 # LAYOUT, not just this repo. Getting that wrong reproduces the exact
 # collection failure the job exists to catch.
+#
+# ⚠ AND REPRODUCING THE LAYOUT IS NOT ENOUGH, which is what made this job red
+# from the day it was written until 2026-09-05. `gen/` is GITIGNORED in
+# openddil-contracts and built on demand, so checking the repo out beside
+# this one produces an empty directory and the conftest's path injection
+# finds nothing. The layout was right and the artifact was absent.
+#
+# The step that generates them is below, and it asserts its own output —
+# a generation that produced nothing would leave the suite in exactly the
+# state the step exists to fix.
 
 on:
   push:
@@ -52,7 +62,7 @@ jobs:
         with:
           path: openddil-logistics-fusion-service
 
-      - name: Checkout contracts (sibling — supplies gen/python)
+      - name: Checkout contracts (sibling — supplies proto/, NOT gen/)
         uses: actions/checkout@v4
         with:
           repository: edgy-solutions/openddil-contracts
@@ -62,6 +72,47 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+
+      # GENERATE THE PROTOBUF BINDINGS. The checkout above does NOT supply
+      # them: `gen/` is gitignored in openddil-contracts and built on demand
+      # by `make python`, so a fresh checkout has an empty tree there and the
+      # conftest's path injection silently finds nothing.
+      #
+      # That is what made this job red. Two of the three sibling repos failed
+      # to COLLECT — `ModuleNotFoundError: No module named 'openddil'`, which
+      # is no signal rather than a set of failures — and the third degraded
+      # instead: its enum-name lookup is a best-effort import, so without the
+      # stubs it stored integers and one test failed with
+      # `assert '2' == 'LIFECYCLE_ACTIVE'`, which reads like a real defect and
+      # is not.
+      #
+      # `python -m grpc_tools.protoc` rather than a `protoc` binary: it is a
+      # pip package, so the runner needs no system dependency and the version
+      # is pinned by the lockfile rather than by whatever the image ships.
+      #
+      # THIS IS GD-13's WORKAROUND, NOT ITS FIX. The generated code is a
+      # contract artifact consumed across repository boundaries — exactly the
+      # thing a package exists to be — and until it is published as one,
+      # every consumer reproduces this step. Three copies of a build
+      # instruction is the debt; this makes it visible rather than red.
+      - name: Generate protobuf bindings (GD-13 workaround)
+        run: |
+          python -m pip install --upgrade pip
+          pip install grpcio-tools
+          cd openddil-contracts
+          mkdir -p gen/python
+          python -m grpc_tools.protoc \
+            --proto_path=proto --python_out=gen/python \
+            $(find proto -name '*.proto')
+          # A generation that produced nothing would leave the suite in
+          # exactly the state this step exists to fix, and the next failure
+          # would look identical. Assert the output instead.
+          n=$(find gen/python -name '*_pb2.py' | wc -l)
+          echo "generated $n protobuf modules"
+          if [ "$n" -lt 1 ]; then
+            echo "::error::no _pb2 modules generated — the suite would fail to collect"
+            exit 1
+          fi
 
       - name: Install
         working-directory: openddil-logistics-fusion-service

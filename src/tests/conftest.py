@@ -39,6 +39,42 @@ _GEN = _REPO_ROOT / "openddil-contracts" / "gen" / "python"
 if _GEN.is_dir():
     sys.path.insert(0, str(_GEN))
 
+# ---------------------------------------------------------------------------
+# THE STUBS MUST EXIST, AND THEIR ABSENCE MUST SAY SO
+# ---------------------------------------------------------------------------
+# `if _GEN.is_dir(): sys.path.insert(...)` was silent when the directory was
+# absent, and silence is the whole problem: what the developer then saw was
+# either `ModuleNotFoundError: No module named 'openddil'` at collection —
+# which aborts pytest before any test runs, so it is NO SIGNAL rather than a
+# set of failures — or, worse, a suite that ran and failed one test with
+# `assert '2' == 'LIFECYCLE_ACTIVE'`, which reads like a real defect in the
+# handler and is not.
+#
+# Neither message names the cause. This does, and it names the command.
+#
+# The check is on the GENERATED MODULES, not on the directory: `gen/python`
+# exists and is empty after a fresh checkout of openddil-contracts, because
+# `gen/` is gitignored there and built on demand. A directory test passes in
+# exactly the situation this guard exists to catch.
+_stub = _GEN / "openddil" / "telemetry" / "v1" / "telemetry_pb2.py"
+if not _stub.exists():
+    raise RuntimeError(
+        "the generated protobuf bindings are missing, so this suite cannot "
+        "collect.\n\n"
+        "  expected: " + str(_stub) + "\n\n"
+        "  generate them with:\n"
+        "    cd " + str(_GEN.parents[1]) + "\n"
+        "    python -m pip install grpcio-tools\n"
+        "    mkdir -p gen/python\n"
+        "    python -m grpc_tools.protoc --proto_path=proto "
+        "--python_out=gen/python $(find proto -name '*.proto')\n\n"
+        "`gen/` is gitignored in openddil-contracts and built on demand, so a "
+        "fresh checkout has an EMPTY tree there. This is GD-13: the generated "
+        "code is a contract artifact consumed across repository boundaries "
+        "and is not published as a package, so every consumer reproduces this "
+        "step."
+    )
+
 # `fusion` itself is imported as a top-level package by the tests.
 _SRC = Path(__file__).resolve().parents[1]
 if _SRC.is_dir():
