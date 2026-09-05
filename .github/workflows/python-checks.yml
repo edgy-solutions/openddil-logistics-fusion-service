@@ -32,9 +32,12 @@ name: Python checks
 # this one produces an empty directory and the conftest's path injection
 # finds nothing. The layout was right and the artifact was absent.
 #
-# The step that generates them is below, and it asserts its own output —
-# a generation that produced nothing would leave the suite in exactly the
-# state the step exists to fix.
+# The step that generates them runs AFTER the install and asserts its own
+# output twice: that files were produced, and that they IMPORT under the
+# runtime the service pins. The second assertion exists because the first
+# one passed while every import failed — generating before the install
+# pulled a grpcio-tools whose gencode the service's own protobuf pin could
+# not load.
 
 on:
   push:
@@ -73,53 +76,64 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      # GENERATE THE PROTOBUF BINDINGS. The checkout above does NOT supply
-      # them: `gen/` is gitignored in openddil-contracts and built on demand
-      # by `make python`, so a fresh checkout has an empty tree there and the
-      # conftest's path injection silently finds nothing.
-      #
-      # That is what made this job red. Two of the three sibling repos failed
-      # to COLLECT — `ModuleNotFoundError: No module named 'openddil'`, which
-      # is no signal rather than a set of failures — and the third degraded
-      # instead: its enum-name lookup is a best-effort import, so without the
-      # stubs it stored integers and one test failed with
-      # `assert '2' == 'LIFECYCLE_ACTIVE'`, which reads like a real defect and
-      # is not.
-      #
-      # `python -m grpc_tools.protoc` rather than a `protoc` binary: it is a
-      # pip package, so the runner needs no system dependency and the version
-      # is pinned by the lockfile rather than by whatever the image ships.
-      #
-      # THIS IS GD-13's WORKAROUND, NOT ITS FIX. The generated code is a
-      # contract artifact consumed across repository boundaries — exactly the
-      # thing a package exists to be — and until it is published as one,
-      # every consumer reproduces this step. Three copies of a build
-      # instruction is the debt; this makes it visible rather than red.
-      - name: Generate protobuf bindings (GD-13 workaround)
-        run: |
-          python -m pip install --upgrade pip
-          pip install grpcio-tools
-          cd openddil-contracts
-          mkdir -p gen/python
-          python -m grpc_tools.protoc \
-            --proto_path=proto --python_out=gen/python \
-            $(find proto -name '*.proto')
-          # A generation that produced nothing would leave the suite in
-          # exactly the state this step exists to fix, and the next failure
-          # would look identical. Assert the output instead.
-          n=$(find gen/python -name '*_pb2.py' | wc -l)
-          echo "generated $n protobuf modules"
-          if [ "$n" -lt 1 ]; then
-            echo "::error::no _pb2 modules generated — the suite would fail to collect"
-            exit 1
-          fi
-
       - name: Install
         working-directory: openddil-logistics-fusion-service
         run: |
           python -m pip install --upgrade pip
           pip install -e . || pip install .
           pip install pytest pytest-cov pytest-asyncio
+
+      # GENERATE THE PROTOBUF BINDINGS — AFTER the install, and pinned to the
+      # runtime the service actually uses.
+      #
+      # The checkout above does NOT supply them: `gen/` is gitignored in
+      # openddil-contracts and built on demand, so a fresh checkout has an
+      # empty tree there and the conftest finds nothing. That is what made
+      # this job red, in two shapes — two sibling repos failed to COLLECT
+      # (`No module named 'openddil'`, which is no signal rather than a set of
+      # failures) and the third degraded instead, storing enum integers and
+      # failing one test with `assert '2' == 'LIFECYCLE_ACTIVE'`, which reads
+      # like a real defect and is not.
+      #
+      # ⚠ ORDER IS LOAD-BEARING, AND GETTING IT WRONG MOVED THE ERROR RATHER
+      # THAN FIXING IT. Generating BEFORE the install pulled the newest
+      # grpcio-tools, which emits gencode against a protobuf 7.x runtime; the
+      # install then downgraded protobuf to the service's own pin (<7.0.0),
+      # and every import died with
+      #
+      #   VersionError: gencode 7.35.1 runtime 6.33.6 — runtime version
+      #   cannot be older than the linked gencode version
+      #
+      # The generated code and the runtime that loads it are ONE decision.
+      # Pinning protobuf to the version already installed forces pip to
+      # resolve a grpcio-tools that agrees with it, and to fail loudly here
+      # if none does — rather than producing stubs the suite cannot import.
+      - name: Generate protobuf bindings (GD-13 workaround)
+        run: |
+          PB=$(python -c "import google.protobuf as p; print(p.__version__)")
+          echo "protobuf runtime installed by the service: $PB"
+          pip install "grpcio-tools" "protobuf==$PB"
+          cd openddil-contracts
+          mkdir -p gen/python
+          python -m grpc_tools.protoc \
+            --proto_path=proto --python_out=gen/python \
+            $(find proto -name '*.proto')
+          n=$(find gen/python -name '*_pb2.py' | wc -l)
+          echo "generated $n protobuf modules"
+          if [ "$n" -lt 1 ]; then
+            echo "::error::no _pb2 modules generated — the suite would fail to collect"
+            exit 1
+          fi
+          # IMPORT ONE, HERE, UNDER THE REAL RUNTIME. Counting files proves
+          # protoc ran; it does not prove the output is loadable, and the
+          # gencode/runtime mismatch above passed a file count and failed
+          # every import. This is the check that would have caught it at the
+          # step that caused it instead of during collection.
+          PYTHONPATH=gen/python python -c "
+          from openddil.telemetry.v1 import telemetry_pb2
+          from openddil.configuration.v1 import as_maintained_pb2
+          print('bindings import cleanly under protobuf', __import__('google.protobuf', fromlist=['x']).__version__)
+          "
 
       # Recorded BEFORE the suite so the artifact is useful even on failure —
       # "which versions was this run against" is the first question asked of
