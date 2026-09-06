@@ -477,6 +477,12 @@ async def _recompute_and_maybe_emit(
             new_severity=status.overall_severity,
             prev_severity=prev_sev or ls.LOGISTICS_SEVERITY_UNSPECIFIED,
             revision=revision,
+            # THE ASSET'S LABELS TRAVEL WITH THE EVENT. Read from the same
+            # state key that stamps asset_logistics_status, so the alert and
+            # the status row cannot disagree about who may see this asset.
+            # Carried, never derived — the projector may not invent them and
+            # neither may this.
+            releasability=(await ctx.get(_KEY_RELEASABILITY)) or {},
             constraining_factors=list(status.constraining_factors),
             origin=origin,
         )
@@ -510,6 +516,7 @@ async def _publish_tactical_event(
     revision: int,
     constraining_factors: list,
     origin: dict,
+    releasability: dict | None = None,
 ) -> None:
     """Build + publish a JSON CloudEvent to the tactical-events topic.
 
@@ -519,7 +526,9 @@ async def _publish_tactical_event(
     _extract_severity helper picks it up via the `severity` priority
     key. Provenance (edge_id, region_id) is stamped into `data` too --
     the handler reads them via resolve_provenance_from_top_level for
-    per-asset row attribution. Top constraining factor (if any) lands
+    per-asset row attribution. `originator_nation` /
+    `releasable_to` ride in `data` beside them, from this object's own
+    state -- the alert must not be visible to anyone the asset is not. Top constraining factor (if any) lands
     in the description-ish slot so the AlertFeed row reads as
     "logistics.transition --- thermal_overload_imminent" rather than
     just "logistics.transition" with the operator wondering what
@@ -556,6 +565,13 @@ async def _publish_tactical_event(
             "top_factor": top_factor,
             "edge_id": origin.get("edge_id", ""),
             "region_id": origin.get("region_id", ""),
+            # ADR-0029 §3. A tactical event is ABOUT an asset, so it is as
+            # releasable as that asset and no more. Emitted only when the
+            # labels are known: an absent key means unlabelled, which
+            # deny-unlabeled reads as releasable to nobody. Emitting empty
+            # values instead would be a label asserting "no nation", which
+            # is a claim rather than a silence.
+            **{k: v for k, v in (releasability or {}).items() if v},
         },
     }
     payload = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
