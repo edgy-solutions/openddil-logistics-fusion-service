@@ -509,7 +509,23 @@ async def _recompute_and_maybe_emit(
     # than by source name, so it is still empty for a DIS-only asset and
     # `_KEY_DERIVED_TELEMETRY` is still the only source of wear for them —
     # the property the old guard protected, protected by the right question.
-    chosen_telemetry_dict = telemetry_dict or derived_telemetry_dict
+    # CHOSEN BY WHAT IT CARRIES, not merely by being present.
+    #
+    # The admission test on the write side stops NEW payload-less records
+    # entering `_KEY_TELEMETRY`. It cannot evict one already stored — Restate
+    # object state is durable, so a record admitted under yesterday's bug
+    # keeps winning this choice forever. Measured: after the write-side fix
+    # deployed and was confirmed in the running container, the fleet still
+    # reported zero wear factors, because every asset's `_KEY_TELEMETRY` still
+    # held the empty-sustainment DIS record from before.
+    #
+    # So the question is asked again HERE, where the record is used. That
+    # makes historical state self-heal and is the better invariant anyway:
+    # the chooser should pick the record that can answer the question being
+    # asked of it, not the one that arrived on a particular topic.
+    chosen_telemetry_dict = (telemetry_dict
+                             if _carries_sustainment(telemetry_dict)
+                             else derived_telemetry_dict)
     telemetry_proto = (_dict_to_telemetry(chosen_telemetry_dict)
                        if chosen_telemetry_dict else None)
 
