@@ -1391,3 +1391,25 @@ def test_axis_name_camel_mapping():
     silently never absorbed."""
     assert _snake_to_camel("health_state") == "healthState"
     assert _snake_to_camel("functional_mode") == "functionalMode"
+
+
+def test_dis_record_with_empty_health_submessage_is_not_admitted():
+    """The regression that cost every wear factor on the lab.
+
+    A DIS Silver record carries sustainment={"health": {}} — present and
+    empty, because proto submessage presence is asserted by writing any
+    field. `bool(sustainment)` is True for it, so the record was admitted to
+    _KEY_TELEMETRY, which _recompute prefers over _KEY_DERIVED_TELEMETRY —
+    and the derived record holding the wear components stopped being chosen.
+    """
+    assert _carries_sustainment({"sustainment": {"health": {}}}) is False
+
+
+def test_record_with_actual_wear_is_admitted():
+    assert _carries_sustainment(
+        {"sustainment": {"wear": {"components": {"track": {}}}}}) is True
+
+
+def test_record_with_fluids_or_consumables_is_admitted():
+    assert _carries_sustainment({"sustainment": {"fluids": {"fuel": {}}}}) is True
+    assert _carries_sustainment({"sustainment": {"consumables": {"ammo": {}}}}) is True

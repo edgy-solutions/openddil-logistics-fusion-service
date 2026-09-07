@@ -191,14 +191,43 @@ def _apply_operational_axes(telemetry_proto, axes: dict) -> None:
         setattr(op, axis, enum_value.number)
 
 
-def _carries_sustainment(record_dict: dict | None) -> bool:
-    """Does this record actually carry sustainment fields?
+# The sustainment sub-messages an evaluator can actually USE. `health` is
+# excluded on purpose: a DIS record carries `sustainment.health` (an empty
+# submessage) and nothing else, and the wear/fuel/ammo evaluators read none
+# of it.
+_SUSTAINMENT_PAYLOAD_FIELDS = ("wear", "fluids", "consumables", "thermal", "power")
 
-    The question the old source-name guard was really asking. Answered of the
-    record, so it stays correct however the producers change.
+
+def _carries_sustainment(record_dict: dict | None) -> bool:
+    """Does this record carry sustainment DATA an evaluator can use?
+
+    ⚠ THE FIRST VERSION OF THIS ASKED `bool(record["sustainment"])` AND WAS
+    WRONG IN THE SAME WAY THE GUARD IT REPLACED WAS WRONG.
+
+    A DIS Silver record carries `sustainment = {"health": {}}` — present, and
+    empty. Proto submessage presence is asserted by writing ANY field, so the
+    container exists while carrying nothing an evaluator reads (GD-12's
+    submessage addendum: for scalars the question is "how do I say nothing?",
+    for submessages it is "how do I avoid accidentally saying something?").
+
+    The consequence, measured on the lab: every DIS record was admitted to
+    `_KEY_TELEMETRY`, which `_recompute` prefers over
+    `_KEY_DERIVED_TELEMETRY`, so the derived record holding the actual wear
+    components stopped being chosen and the fleet lost EVERY wear factor.
+    The RCV-M sitting at 100% consumed track read OK.
+
+    So: test the payload, not the container. I replaced a source-name
+    correlate with a key-presence correlate, which is the same mistake at a
+    shorter distance — the property is "carries usable sustainment data", and
+    that is what this now asks.
     """
-    sust = (record_dict or {}).get("sustainment")
-    return bool(sust)
+    sust = (record_dict or {}).get("sustainment") or {}
+    if not isinstance(sust, dict):
+        return False
+    for field in _SUSTAINMENT_PAYLOAD_FIELDS:
+        if sust.get(field):
+            return True
+    return False
 
 
 async def _absorb_operational_state(ctx, record_dict: dict | None) -> None:
