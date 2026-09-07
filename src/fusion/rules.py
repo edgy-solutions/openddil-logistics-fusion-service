@@ -308,6 +308,84 @@ def _factor_origin(sustainment: tel.SustainmentMetrics) -> int:
     return tel.ORIGIN_UNSPECIFIED
 
 
+# ---------------------------------------------------------------------------
+# WEAR-COMPONENT MANIFEST (GD-14) — does this platform HAVE this component?
+# ---------------------------------------------------------------------------
+# Until 2026-09-06 every wear axis was derived for every asset that moved,
+# which produced four helicopters reporting 100.0% TRACK wear. The axis was
+# applicable because the model could compute it, not because the platform had
+# the part.
+#
+# The declaration is per PLATFORM CLASS, not per asset: whether an AH-64E has
+# tracks is the same for every AH-64E. That is deliberately NOT the CM
+# baseline, which is a per-asset authorized-configuration fact — measured
+# coverage 3 of 14 assets, no baseline declaring `track` at all, and slot
+# names (`engine-left`) that do not match axis names (`engine`). Two declared
+# vocabularies that do not align are usually not fixed by a mapping between
+# them but by a third declaration at the level the fact actually lives.
+#
+# THREE OUTCOMES. The middle one is the whole point:
+#   declared present -> evaluate
+#   declared absent  -> NOT APPLICABLE: no factor, and explicitly not
+#                       "unknown". The component does not exist, so nothing
+#                       about it is unknown. Reporting a helicopter's track
+#                       wear as UNKNOWN would claim we are missing data about
+#                       a part that is not there.
+#   no manifest      -> UNKNOWN: we have not been told what this platform
+#                       carries, which is a real gap and must not be silently
+#                       treated as "has everything".
+def _load_wear_manifest() -> dict[str, set[str]]:
+    """variant -> declared component set. Absent file => empty mapping, which
+    makes every variant UNKNOWN rather than every variant fully-equipped."""
+    out: dict[str, set[str]] = {}
+    try:
+        import yaml  # type: ignore
+        path = os.path.join(ONTOLOGY_DIR, "wear_component_manifest.yaml")
+        with open(path, encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh) or {}
+        for variant, spec in (doc.get("platforms") or {}).items():
+            comps = (spec or {}).get("components")
+            if not isinstance(comps, list):
+                logger.warning(
+                    "wear_component_manifest.yaml: %r has no component list; "
+                    "treating as UNDECLARED rather than as empty", variant,
+                )
+                continue
+            out[str(variant)] = {str(c) for c in comps}
+    except FileNotFoundError:
+        logger.warning(
+            "wear_component_manifest.yaml not found in %s — every wear axis "
+            "will report UNKNOWN. This is the honest default: without a "
+            "manifest we do not know which components a platform carries, "
+            "and assuming it carries all of them is how helicopters came to "
+            "have track wear.", ONTOLOGY_DIR,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("wear_component_manifest.yaml unreadable (%s); "
+                        "every wear axis will report UNKNOWN", exc)
+    return out
+
+
+_WEAR_MANIFEST: dict[str, set[str]] = _load_wear_manifest()
+
+
+def set_wear_manifest_for_test(mapping: dict[str, set[str]] | None) -> None:
+    """TEST SEAM. The manifest is loaded once at import, which is right for a
+    service and wrong for a test: without it every test ran against an empty
+    manifest and therefore against the UNKNOWN branch, which is exactly one
+    of the three behaviours under test. Injecting keeps all three reachable."""
+    global _WEAR_MANIFEST
+    _WEAR_MANIFEST = {} if mapping is None else dict(mapping)
+
+
+def wear_axis_applicability(variant: str, component: str) -> str:
+    """'evaluate' | 'not_applicable' | 'unknown'."""
+    declared = _WEAR_MANIFEST.get(variant)
+    if declared is None:
+        return "unknown"
+    return "evaluate" if component in declared else "not_applicable"
+
+
 def _eval_wear(inputs: FusionInputs,
                 thresholds: Thresholds) -> list[ls.ConstrainingFactor]:
     """One factor per component whose wear% crosses a threshold.
@@ -325,6 +403,27 @@ def _eval_wear(inputs: FusionInputs,
     factors: list[ls.ConstrainingFactor] = []
     components = sustainment.wear.components
     for name, state in components.items():
+        # GATE FIRST, before reading any value: whether the platform HAS this
+        # component is prior to what the sensor says about it.
+        applies = wear_axis_applicability(inputs.platform_variant, name)
+        if applies == "not_applicable":
+            # The platform does not carry this component. No factor, and
+            # deliberately no UNKNOWN either — see the manifest comment.
+            logger.debug("wear axis %r not applicable to %s", name,
+                         inputs.platform_variant)
+            continue
+        if applies == "unknown":
+            # No manifest entry for this variant. We do not know whether the
+            # component exists, so we decline to assert wear on it. Logged at
+            # INFO because an undeclared platform is a gap someone should
+            # close, not a routine condition.
+            logger.info(
+                "wear axis %r for %s: UNDECLARED platform, no factor emitted "
+                "(add it to wear_component_manifest.yaml)",
+                name, inputs.platform_variant,
+            )
+            continue
+
         rul = _quantity_to_pint(state.remaining_useful_life)
         if rul is None:
             continue

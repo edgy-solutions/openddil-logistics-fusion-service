@@ -14,6 +14,8 @@ import time
 
 import pytest
 
+from fusion import rules
+
 from openddil.common.v1 import quantity_pb2 as qpb
 from openddil.logistics.v1 import logistics_status_pb2 as ls
 from openddil.telemetry.v1 import telemetry_pb2 as tel
@@ -41,6 +43,20 @@ from fusion.thresholds import Thresholds
 # ---------------------------------------------------------------------------
 ASSET_ID = "USA-ARMY-1HBCT-M1A2-4773"
 VARIANT = "M1A2-SEPv3"
+
+
+# The wear-component manifest is loaded once at import from /ontology, which
+# does not exist in a test environment — so without this every test would run
+# against the UNDECLARED branch and silently stop exercising wear at all.
+# Declaring the test variant restores the pre-manifest behaviour for the
+# existing cases; the three states get their own tests below.
+@pytest.fixture(autouse=True)
+def _declare_test_variant():
+    rules.set_wear_manifest_for_test(
+        {VARIANT: {"track", "engine", "barrel", "suspension", "transmission"}}
+    )
+    yield
+    rules.set_wear_manifest_for_test(None)
 
 
 def _thr(**overrides) -> Thresholds:
@@ -1286,3 +1302,53 @@ def test_wear_factor_origin_unspecified_for_legacy_measured_path():
     assert factors[0].origin == tel.ORIGIN_UNSPECIFIED
     # And the legacy time-units path must still produce the correct severity.
     assert factors[0].severity == ls.LOGISTICS_SEVERITY_CRITICAL
+
+
+# ===========================================================================
+# Wear-component manifest — three states, and the middle one is the point
+# ===========================================================================
+# GD-14: every wear axis was derived for every asset that moved, so four
+# helicopters reported 100.0% TRACK wear. The axis was applicable because
+# the model could compute it, not because the platform had the part.
+def test_declared_present_evaluates():
+    rules.set_wear_manifest_for_test({"M1A2-SEPv3": {"track"}})
+    assert rules.wear_axis_applicability("M1A2-SEPv3", "track") == "evaluate"
+
+
+def test_declared_absent_is_not_applicable_not_unknown():
+    """The distinction this whole manifest exists for.
+
+    A helicopter has no tracks. Reporting that as UNKNOWN would claim the
+    system is missing data about a component that is not there — an absence
+    of a claim rendered as a claim of absence of data. Not-applicable says
+    the question does not arise."""
+    rules.set_wear_manifest_for_test({"UH-60M": {"engine"}})
+    assert rules.wear_axis_applicability("UH-60M", "track") == "not_applicable"
+    assert rules.wear_axis_applicability("UH-60M", "engine") == "evaluate"
+
+
+def test_no_manifest_entry_is_unknown_not_fully_equipped():
+    """An undeclared platform must not default to having everything — that
+    default is precisely how helicopters came to have track wear."""
+    rules.set_wear_manifest_for_test({"M1A2-SEPv3": {"track"}})
+    assert rules.wear_axis_applicability("SOMETHING-UNDECLARED", "track") == "unknown"
+
+
+def test_empty_manifest_makes_everything_unknown():
+    """The file being absent or unreadable must fail toward UNKNOWN, never
+    toward evaluating every axis for every platform."""
+    rules.set_wear_manifest_for_test(None)
+    for comp in ("track", "engine", "barrel", "suspension"):
+        assert rules.wear_axis_applicability("M1A2-SEPv3", comp) == "unknown"
+
+
+def test_undeclared_platform_emits_no_wear_factor():
+    """End to end: the gate suppresses the factor rather than the value."""
+    rules.set_wear_manifest_for_test({})
+    factors = _eval_wear(
+        FusionInputs(ASSET_ID, VARIANT,
+                      _telemetry(wear={"track": (4900.0, 100.0)}),
+                      None, None),
+        Thresholds(),
+    )
+    assert factors == []
