@@ -1352,3 +1352,42 @@ def test_undeclared_platform_emits_no_wear_factor():
         Thresholds(),
     )
     assert factors == []
+
+
+# ===========================================================================
+# UD-13 — admit by content, not by source name
+# ===========================================================================
+# The deleted guard read `if "DIS" in src.upper(): return`, justified as
+# "they have no sustainment fields". True when written, false once the
+# appearance-bits mapping gave DIS records an operational_state. These pin
+# the property the guard was really protecting, asked of the record.
+from workflows.asset_logistics import (  # noqa: E402
+    _carries_sustainment, _snake_to_camel,
+)
+
+
+def test_record_without_sustainment_is_not_admitted():
+    """The protection the source-name guard provided, kept.
+
+    _recompute prefers _KEY_TELEMETRY over _KEY_DERIVED_TELEMETRY, so a
+    sustainment-less record admitted there would blank wear for exactly the
+    DIS-only fleet this change is meant to help."""
+    assert _carries_sustainment({"assetId": "dis:1:1:1000"}) is False
+    assert _carries_sustainment({"sustainment": {}}) is False
+    assert _carries_sustainment(None) is False
+
+
+def test_record_with_sustainment_is_admitted_whatever_its_source():
+    """And the converse: a DIS-sourced record that DID carry sustainment
+    would now be admitted, where the old guard refused it on its name."""
+    rec = {"provenance": {"sourceProtocol": "DIS"},
+           "sustainment": {"wear": {"components": {"track": {}}}}}
+    assert _carries_sustainment(rec) is True
+
+
+def test_axis_name_camel_mapping():
+    """Silver arrives camelCased through MessageToDict; the axes are named
+    in snake_case in the proto. Both spellings must resolve or an axis is
+    silently never absorbed."""
+    assert _snake_to_camel("health_state") == "healthState"
+    assert _snake_to_camel("functional_mode") == "functionalMode"

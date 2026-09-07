@@ -163,6 +163,78 @@ async def _refresh_origin(ctx, event_dict: dict | None) -> None:
         })
 
 
+_OPERATIONAL_AXES = ("health_state", "power_state", "functional_mode")
+
+
+def _apply_operational_axes(telemetry_proto, axes: dict) -> None:
+    """Write the remembered axes onto the telemetry the rules will read.
+
+    Only axes an actual source SET are written. An axis nobody has spoken to
+    stays at its proto default, which is the UNSPECIFIED the absence
+    convention requires — this must never manufacture a claim to fill a gap.
+    """
+    op = telemetry_proto.operational_state
+    for axis, entry in (axes or {}).items():
+        value = (entry or {}).get("value")
+        if not value or axis not in _OPERATIONAL_AXES:
+            continue
+        field = op.DESCRIPTOR.fields_by_name.get(axis)
+        if field is None or field.enum_type is None:
+            continue
+        enum_value = field.enum_type.values_by_name.get(value)
+        if enum_value is None:
+            # A source said something this build's enum does not know. Not a
+            # claim we can act on, and not one to guess at.
+            logger.warning("operational axis %s carried unknown value %r; "
+                            "leaving the axis unset", axis, value)
+            continue
+        setattr(op, axis, enum_value.number)
+
+
+def _carries_sustainment(record_dict: dict | None) -> bool:
+    """Does this record actually carry sustainment fields?
+
+    The question the old source-name guard was really asking. Answered of the
+    record, so it stays correct however the producers change.
+    """
+    sust = (record_dict or {}).get("sustainment")
+    return bool(sust)
+
+
+async def _absorb_operational_state(ctx, record_dict: dict | None) -> None:
+    """Merge whatever operational axes this record carries, per axis.
+
+    Last-writer-wins PER AXIS rather than per record: a source that speaks to
+    one axis must not blank the two it says nothing about. Each axis keeps the
+    source and sample time that set it, so a later disagreement between two
+    sources about the same axis is visible rather than silently resolved by
+    arrival order.
+    """
+    op = (record_dict or {}).get("operationalState") or          (record_dict or {}).get("operational_state") or {}
+    if not op:
+        return
+    prov = (record_dict or {}).get("provenance") or {}
+    source = prov.get("sourceProtocol") or prov.get("source_protocol") or "unknown"
+    sample_time = (record_dict or {}).get("sampleTime") or                   (record_dict or {}).get("sample_time") or ""
+
+    current = (await ctx.get(_KEY_OPERATIONAL_STATE, type_hint=dict)) or {}
+    changed = False
+    for axis in _OPERATIONAL_AXES:
+        value = op.get(axis) or op.get(_snake_to_camel(axis))
+        if not value:
+            continue                       # this source says nothing on this axis
+        current[axis] = {"value": value, "source": source,
+                         "sample_time": str(sample_time)}
+        changed = True
+    if changed:
+        ctx.set(_KEY_OPERATIONAL_STATE, current)
+
+
+def _snake_to_camel(name: str) -> str:
+    head, *rest = name.split("_")
+    return head + "".join(p.title() for p in rest)
+
+
 async def _refresh_provenance(ctx, event_dict: dict | None) -> None:
     """Refresh EVERYTHING an emission inherits from an inbound event.
 
@@ -207,6 +279,21 @@ _KEY_TELEMETRY = "latest_telemetry_dict"
 # asset case). No per-component merging in Phase 5 — the engine sees one or
 # the other.
 _KEY_DERIVED_TELEMETRY = "latest_derived_telemetry_dict"
+# UD-13. The latest OPERATIONAL state per axis, regardless of which source
+# supplied it. Separate from `_KEY_TELEMETRY` because the two answer
+# different questions: that key holds the record wear is computed from, this
+# one holds what any source last said about health / power / mode.
+#
+# Shape: {axis: {"value": str, "source": str, "sample_time": str}}
+#
+# PER-AXIS, and stamped, because a DIS record carries health (decoded from
+# appearance bits) while a richer feed carries all three — so two sources
+# speak to the same asset at different cadences, which is ADR-0041's cadence
+# asymmetry arriving inside a single asset. Last-writer-wins per axis is the
+# rule; the stamps are what make a cross-source disagreement (DIS says FAULT,
+# another feed says NOMINAL, minutes apart) DETECTABLE later. The detector is
+# not built — the stamps only make it possible.
+_KEY_OPERATIONAL_STATE = "operational_state_axes"
 _KEY_WINDOWS = "latest_windows_dict"
 _KEY_CM_STATE = "cm_state_dict"
 # Sub-phase F: latest weapons-capability snapshot for this asset
@@ -277,12 +364,23 @@ async def on_proprietary_update(ctx: restate.ObjectContext, raw: bytes) -> None:
     if not record_dict:
         return
 
-    # Skip DIS-sourced events — they have no sustainment fields.
-    src = (record_dict.get("provenance") or {}).get("sourceProtocol", "")
-    if "DIS" in src.upper():
-        return
-
-    ctx.set(_KEY_TELEMETRY, record_dict)
+    # UD-13: ADMITTED BY CONTENT, NEVER BY SOURCE NAME.
+    #
+    # This used to read `if "DIS" in src.upper(): return`, justified as "they
+    # have no sustainment fields". That was true when written and false from
+    # 2026-08-19, when the appearance-bits mapping gave DIS records an
+    # operational_state. The guard tested a CORRELATE of the property it
+    # cared about, and the correlate expired while the guard did not.
+    #
+    # What it was protecting is real and is preserved below: `_recompute`
+    # prefers `_KEY_TELEMETRY` over `_KEY_DERIVED_TELEMETRY`, so admitting a
+    # sustainment-less record there would blank wear for exactly the fleet
+    # this helps. So the question is now asked of the RECORD — does it carry
+    # sustainment? — which is true forever, rather than of its source name,
+    # which was true until someone improved DIS.
+    await _absorb_operational_state(ctx, record_dict)
+    if _carries_sustainment(record_dict):
+        ctx.set(_KEY_TELEMETRY, record_dict)
     await _refresh_provenance(ctx, record_dict)
     await _recompute_and_maybe_emit(ctx, asset_id, trigger="telemetry")
     await _schedule_next_timer(ctx, asset_id)
@@ -375,13 +473,24 @@ async def _recompute_and_maybe_emit(
     cm_dict = await ctx.get(_KEY_CM_STATE, type_hint=dict)
     capability_dict = await ctx.get(_KEY_CAPABILITY, type_hint=dict)
 
+    operational_axes = await ctx.get(_KEY_OPERATIONAL_STATE, type_hint=dict)
+
     # Phase 5 merge rule: measured wins, derived fills the DIS-asset gap.
-    # `on_proprietary_update` already drops DIS-sourced events (no
-    # sustainment), so `_KEY_TELEMETRY` is empty for DIS-only assets;
-    # `_KEY_DERIVED_TELEMETRY` is the only source of wear for them.
+    # `_KEY_TELEMETRY` now admits by CONTENT (carries sustainment) rather
+    # than by source name, so it is still empty for a DIS-only asset and
+    # `_KEY_DERIVED_TELEMETRY` is still the only source of wear for them —
+    # the property the old guard protected, protected by the right question.
     chosen_telemetry_dict = telemetry_dict or derived_telemetry_dict
     telemetry_proto = (_dict_to_telemetry(chosen_telemetry_dict)
                        if chosen_telemetry_dict else None)
+
+    # UD-13: the operational axes are applied OVER the chosen record, from
+    # whichever source last spoke to each one. Without this a DIS-sourced
+    # fault reached the read model (the projector writes it from the same
+    # Silver message) and never reached severity — three signals said the
+    # path was live and it was not.
+    if telemetry_proto is not None and operational_axes:
+        _apply_operational_axes(telemetry_proto, operational_axes)
     windows_proto = _dict_to_windows(windows_dict) if windows_dict else None
     cm_proto = _dict_to_cm_state(cm_dict) if cm_dict else None
 
