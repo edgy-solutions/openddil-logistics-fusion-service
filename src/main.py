@@ -50,7 +50,13 @@ def _build_producer() -> Producer:
         "bootstrap.servers":  brokers,
         "acks":               "all",
         "linger.ms":          20,
-        "compression.type":   "zstd",
+        "compression.type":   "lz4",   # NOT zstd: Restate's librdkafka has no
+                                      # zstd, and one zstd batch kills its
+                                      # consumer task forever (it restarts
+                                      # at the same batch and dies again).
+                                      # The chart's lz4 topic pin is a
+                                      # broker-side mitigation of THIS line;
+                                      # keep both, but this is the real fix.
         "enable.idempotence": True,
     }
     producer = Producer(conf)
