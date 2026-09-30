@@ -23,6 +23,7 @@ import signal
 import sys
 from pathlib import Path
 
+import prometheus_client
 from confluent_kafka import KafkaException, Producer
 
 # Generated proto bindings are on PYTHONPATH (set by Dockerfile)
@@ -42,6 +43,22 @@ def _configure_logging() -> None:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         stream=sys.stdout,
     )
+
+
+def _start_metrics_server() -> None:
+    """Expose the counters in `metrics.py` (e.g. the removal-unknown-key
+    drop counter) for scraping. Non-fatal: a port already in use (two
+    instances on one host, a stale process) must not stop the service from
+    doing its real job."""
+    port = int(os.environ.get("METRICS_PORT", "9464"))
+    try:
+        prometheus_client.start_http_server(port)
+        logger.info("Prometheus metrics server listening on :%d", port)
+    except OSError as exc:
+        logger.warning(
+            "Could not start Prometheus metrics server on :%d (%s); "
+            "continuing without metrics exposition", port, exc,
+        )
 
 
 def _build_producer() -> Producer:
@@ -129,6 +146,8 @@ def main() -> None:
 
     # Self-check ontology consistency. WARN-level, non-fatal.
     check_ontology_consistency()
+
+    _start_metrics_server()
 
     # Install thresholds (env-driven, used by every handler invocation).
     thresholds = Thresholds.from_env()

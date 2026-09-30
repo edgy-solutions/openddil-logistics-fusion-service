@@ -59,6 +59,7 @@ from openddil.telemetry.v1 import telemetry_pb2 as tel
 
 from fusion.rules import FusionInputs, compute_logistics_status
 from fusion.thresholds import Thresholds
+from metrics import removal_unknown_asset_dropped_total
 
 logger = logging.getLogger("logistics.asset_logistics")
 
@@ -230,6 +231,57 @@ def _carries_sustainment(record_dict: dict | None) -> bool:
     return False
 
 
+def _is_removal(record_dict: dict | None) -> bool:
+    """Does this record claim OPERATIONAL_STATUS_REMOVED (ADR-0044 §A)?
+
+    A Remove Entity PDU decoded by `_decode_telemetry_event` carries this on
+    `operational_state.operational_status`. Two shapes reach this function:
+
+      * The production path — proto bytes through `MessageToDict(...,
+        preserving_proto_field_name=False)` — renders the field name as
+        `operationalStatus` and the enum VALUE as its NAME STRING (the
+        default is `use_integers_for_enums=False`, and nothing here passes
+        that kwarg), so this is `"OPERATIONAL_STATUS_REMOVED"`.
+      * `_decode_telemetry_event`'s dict-passthrough branch (tests, and any
+        future JSON-native producer) — shape not otherwise constrained, so
+        both the proto snake_case field name and an int enum value (4, the
+        wire value — see `tel.OPERATIONAL_STATUS_REMOVED`) are also
+        accepted, mirroring how `_absorb_operational_state` already checks
+        both `operationalState`/`operational_state` for the container.
+    """
+    op = ((record_dict or {}).get("operationalState")
+          or (record_dict or {}).get("operational_state") or {})
+    if not isinstance(op, dict):
+        return False
+    status = op.get("operationalStatus")
+    if status is None:
+        status = op.get("operational_status")
+    return status in ("OPERATIONAL_STATUS_REMOVED", tel.OPERATIONAL_STATUS_REMOVED)
+
+
+# ADR-0044 lifecycle gate: the state keys any inbound handler can set BEFORE
+# its own first `_recompute_and_maybe_emit` call in the SAME invocation.
+# Checking all five, rather than relying on `_KEY_LAST_SEVERITY` alone, is
+# the minimal set that stays reliable if a future handler changes order:
+# today every one of the other four is written by a handler that always
+# reaches `_recompute_and_maybe_emit` immediately afterward, and that first
+# call always emits (`is_initial` is true whenever `_KEY_LAST_SEVERITY` is
+# still None) — so in the CURRENT control flow, `_KEY_LAST_SEVERITY` alone
+# would already answer "has this asset_id been seen before?" correctly.
+# But that is a fact about today's call order in each handler, not a
+# contract those four keys promise, and this gate exists specifically to
+# stop a never-seen asset_id from acquiring state — it should not depend on
+# every future handler continuing to recompute-and-emit in the same
+# invocation as its first write. `_KEY_WINDOWS` and `_KEY_CAPABILITY` are
+# left out on purpose: they are not in the five candidates this gate is
+# scoped to (windowed-telemetry and capability-snapshot assets already
+# satisfy "known" via `_KEY_LAST_SEVERITY`, set on their own first event by
+# the same first-invocation-always-emits rule above).
+#
+# (`_KNOWN_ASSET_KEYS` / `_has_known_state` are defined further down, once
+# the `_KEY_*` state-key constants they reference exist.)
+
+
 async def _absorb_operational_state(ctx, record_dict: dict | None) -> None:
     """Merge whatever operational axes this record carries, per axis.
 
@@ -334,6 +386,22 @@ _KEY_LAST_SEVERITY = "last_emitted_severity"
 _KEY_REVISION = "status_revision"
 _KEY_NEXT_TIMER = "next_timer_ns"
 
+# ADR-0044 lifecycle gate (removal-unknown-key): the "known key" candidates
+# — see the comment above `_is_removal` for why these five and not fewer.
+_KNOWN_ASSET_KEYS = (
+    _KEY_LAST_SEVERITY, _KEY_TELEMETRY, _KEY_DERIVED_TELEMETRY,
+    _KEY_OPERATIONAL_STATE, _KEY_CM_STATE,
+)
+
+
+async def _has_known_state(ctx) -> bool:
+    """True if this Virtual Object instance has ever recorded state for this
+    asset_id, per `_KNOWN_ASSET_KEYS` above."""
+    for key in _KNOWN_ASSET_KEYS:
+        if (await ctx.get(key)) is not None:
+            return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Virtual Object declaration
@@ -391,6 +459,17 @@ async def on_proprietary_update(ctx: restate.ObjectContext, raw: bytes) -> None:
     asset_id = ctx.key()
     record_dict = _decode_telemetry_event(raw)
     if not record_dict:
+        return
+
+    # Removal-unknown-key gate: the upstream kind gate that used to keep a
+    # stateless removal from reaching an asset_id this VO has never heard of
+    # is becoming stateless itself (every removal now passes by PDU type),
+    # so a Remove Entity for a never-seen asset_id must be dropped HERE,
+    # before any state is created for it — not absorbed, not emitted, no
+    # timer scheduled. A removal for an asset_id this VO already knows
+    # follows the unchanged path below.
+    if _is_removal(record_dict) and not await _has_known_state(ctx):
+        removal_unknown_asset_dropped_total.inc()
         return
 
     # UD-13: ADMITTED BY CONTENT, NEVER BY SOURCE NAME.
