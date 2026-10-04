@@ -1,0 +1,15 @@
+name: asset_id is opaque
+
+# ADR-0047: fails on a new place that parses asset_id. The checker and its
+# canary live in openddil-contracts; exceptions go in .asset-id-allowlist
+# at this repo's root, one line each with a reason.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    uses: edgy-solutions/openddil-contracts/.github/workflows/asset-id-opaque.yml@main
