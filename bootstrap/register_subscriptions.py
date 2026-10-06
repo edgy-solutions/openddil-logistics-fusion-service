@@ -111,6 +111,13 @@ def _hq_subscriptions() -> list[Subscription]:
             handler="AssetLogistics/on_cm_state_change",
             consumer_group="fusion-service-cm-state-hq",
         ),
+        # ADR-0028: asset-registry-service publishes to HQ only, same as
+        # cm-service above -- one registry, one place fusion reads it from.
+        Subscription(
+            topic="asset-registry-events",
+            handler="AssetLogistics/on_registry_event",
+            consumer_group="fusion-service-registry-hq",
+        ),
     ]
 
 

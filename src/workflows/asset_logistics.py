@@ -28,6 +28,12 @@ Inputs (delivered by Restate Kafka subscriptions):
     - source topic: effector-events, keyed by launcher_urn
     - Fire accumulates expended[munition_key] (deduped by event_urn) and
       drives the effector-supply evaluator; Detonation is counted only
+  on_registry_event(asset-registry-events-JSON)
+    - source topic: asset-registry-events, keyed by asset_id
+    - asset-registry-service's own record of this asset (ADR-0028); the
+      only field this object reads from it is platform_variant. Records
+      a non-empty value when it differs from what's stored; never emits,
+      never schedules a timer — it's an enrichment input, not a trigger
   on_timer()
     - scheduled callback, fires every EMIT_INTERVAL_SECONDS
 
@@ -42,6 +48,7 @@ Durable state keys per asset:
   latest_capability_dict         — last AssetCapabilitySnapshot (as dict)
   effector_expended_dict         — Σ quantity fired per munition_key
   effector_counted_urns_list     — dedup set (ordered list) of counted Fire event_urns
+  registry_platform_variant      — platform_variant as last recorded by asset_registry
   last_emitted_severity          — int (LogisticsSeverity enum value)
   status_revision                — uint64, increments per emission
   next_timer_ns                  — int, unix ns of the next scheduled on_timer
@@ -425,6 +432,13 @@ _KEY_CAPABILITY = "latest_capability_dict"
 # separate reset path exists or is needed for either.
 _KEY_EFFECTOR_EXPENDED = "effector_expended_dict"
 _KEY_EFFECTOR_COUNTED_URNS = "effector_counted_urns_list"
+# ADR-0028: asset_registry's own platform_variant, as last published on
+# asset-registry-events. Separate from the capability/telemetry-derived
+# guesses `_recompute_and_maybe_emit` falls back to -- this one is RECORDED
+# by the registry, not read off whichever event happened to carry it, so it
+# is preferred over them (see the resolution order where platform_variant
+# is computed).
+_KEY_REGISTRY_PLATFORM_VARIANT = "registry_platform_variant"
 _KEY_LAST_SEVERITY = "last_emitted_severity"
 _KEY_REVISION = "status_revision"
 _KEY_NEXT_TIMER = "next_timer_ns"
@@ -660,6 +674,40 @@ async def on_effector_event(ctx: restate.ObjectContext, raw: bytes) -> None:
     await _schedule_next_timer(ctx, asset_id)
 
 
+@asset_logistics.handler(
+    "on_registry_event",
+    accept="*/*",
+    input_serde=restate.serde.BytesSerde(),
+)
+async def on_registry_event(ctx: restate.ObjectContext, raw: bytes) -> None:
+    """Consume asset-registry-service's own record for this asset
+    (`asset-registry-events`, keyed by `asset_id` — the same key this
+    Virtual Object is keyed by). The only field read is
+    `platform_variant`; everything else in the payload (edge_id,
+    region_id, assignment_source, divergent, ...) belongs to a
+    different concern and is ignored here.
+
+    Mirrors `on_capability_snapshot`'s JSON handling, but stores rather
+    than drives: a non-empty variant that differs from what's already
+    recorded is written to `_KEY_REGISTRY_PLATFORM_VARIANT`; an empty
+    or unchanged one is a no-op. Unlike every other handler in this
+    module, this one never recomputes, never emits, and never schedules
+    a timer — the registry's variant is read lazily, from state, the
+    next time `_recompute_and_maybe_emit` runs for any other reason.
+    Recording it is not itself news."""
+    event = _decode_registry_event(raw)
+    if not event:
+        return
+
+    variant = event.get("platform_variant") or ""
+    if not variant:
+        return
+
+    current = await ctx.get(_KEY_REGISTRY_PLATFORM_VARIANT, type_hint=str)
+    if variant != current:
+        ctx.set(_KEY_REGISTRY_PLATFORM_VARIANT, variant)
+
+
 @asset_logistics.handler("on_timer")
 async def on_timer(ctx: restate.ObjectContext, _: dict | None = None) -> None:
     """Scheduled tick. Recompute (some factors are time-dependent — staleness,
@@ -726,8 +774,16 @@ async def _recompute_and_maybe_emit(
     windows_proto = _dict_to_windows(windows_dict) if windows_dict else None
     cm_proto = _dict_to_cm_state(cm_dict) if cm_dict else None
 
+    # Registry first: asset_registry RECORDS platform_variant (ADR-0028),
+    # so once it has one it's the asset's answer, not a per-event guess.
+    # telemetry/windows are what's left for a DIS-only asset the registry
+    # hasn't recorded a variant for yet -- whichever event happened to
+    # carry it, which is why they're the fallback and not the source.
+    registry_variant = await ctx.get(_KEY_REGISTRY_PLATFORM_VARIANT, type_hint=str)
     platform_variant = ""
-    if telemetry_proto is not None and telemetry_proto.asset.platform_variant:
+    if registry_variant:
+        platform_variant = registry_variant
+    elif telemetry_proto is not None and telemetry_proto.asset.platform_variant:
         platform_variant = telemetry_proto.asset.platform_variant
     elif windows_proto is not None and windows_proto.platform_variant:
         platform_variant = windows_proto.platform_variant
@@ -1048,6 +1104,24 @@ def _decode_effector_event(raw: bytes | dict | None) -> dict:
         return decoded if isinstance(decoded, dict) else {}
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         logger.warning("Failed to decode effector event (len=%d): %s",
+                        len(raw) if raw else 0, exc)
+        return {}
+
+
+def _decode_registry_event(raw: bytes | dict | None) -> dict:
+    """`asset-registry-events` is JSON-only, same contract as
+    `asset-capability-snapshot` and `effector-events` — no proto fallback."""
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        text = (raw.decode("utf-8")
+                if isinstance(raw, (bytes, bytearray)) else str(raw))
+        decoded = json.loads(text)
+        return decoded if isinstance(decoded, dict) else {}
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to decode registry event (len=%d): %s",
                         len(raw) if raw else 0, exc)
         return {}
 
