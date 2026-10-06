@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
 
 from google.protobuf import duration_pb2
@@ -211,6 +211,17 @@ class FusionInputs:
     # `asset-capability-snapshot` — a JSON dict, not a proto). Optional and
     # last so every existing positional construction site keeps working.
     capability_snapshot: dict | None = None
+    # Effector supply: Σ quantity fired per munition_key, accumulated from
+    # fusion's own `effector-events` subscription (not telemetry, not the
+    # projector's table). Keyword-defaulted for the same reason as
+    # `capability_snapshot` above — every existing positional construction
+    # site keeps working.
+    effector_expended: dict[str, int] = field(default_factory=dict)
+    # The resolved declared-load map for THIS asset (asset-keyed entry wins
+    # over variant-keyed over nothing declared — resolved by the caller via
+    # `fusion.effector_supply.resolve_declared` before building this
+    # dataclass, so this evaluator stays a pure lookup against a dict).
+    effector_declared: dict[str, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +300,44 @@ def _eval_ammo(inputs: FusionInputs,
             description=(
                 f"Ammunition {slot} at {pct:.1f}% "
                 f"({state.quantity_remaining}/{state.quantity_capacity})"
+            ),
+            current_value=_ucum_quantity(pct, "%"),
+            threshold=_ucum_quantity(threshold, "%"),
+        ))
+    return factors
+
+
+def _eval_effector_supply(inputs: FusionInputs,
+                           thresholds: Thresholds) -> list[ls.ConstrainingFactor]:
+    """One factor per munition key that has a declared load. No declared
+    load -> no factor: unknown is not red, the same stance the declared-load
+    file's absent-entry case takes.
+
+    `effector_expended` and `effector_declared` are independent witnesses
+    from telemetry consumables (`_eval_ammo` above): expended is
+    accumulated from fusion's own `effector-events` subscription, never
+    from telemetry. Both evaluators run and the worse of the two wins via
+    `_max_severity` in `compute_logistics_status` -- disagreement between
+    them is itself worth surfacing, not resolved here."""
+    factors: list[ls.ConstrainingFactor] = []
+    for munition_key, declared in inputs.effector_declared.items():
+        expended = inputs.effector_expended.get(munition_key, 0)
+        remaining = declared - expended
+        pct = 0.0 if declared == 0 else max(remaining, 0) * 100.0 / declared
+        if pct <= thresholds.ammo_pct_critical:
+            sev = ls.LOGISTICS_SEVERITY_CRITICAL
+            threshold = thresholds.ammo_pct_critical
+        elif pct <= thresholds.ammo_pct_degraded:
+            sev = ls.LOGISTICS_SEVERITY_DEGRADED
+            threshold = thresholds.ammo_pct_degraded
+        else:
+            continue
+        factors.append(ls.ConstrainingFactor(
+            factor_id=f"effector.{munition_key}",
+            severity=sev,
+            description=(
+                f"Effector {munition_key} remaining {remaining}/{declared} "
+                f"(expended {expended})"
             ),
             current_value=_ucum_quantity(pct, "%"),
             threshold=_ucum_quantity(threshold, "%"),
@@ -857,6 +906,7 @@ def compute_logistics_status(
     if (f := _eval_fuel(inputs, thresholds)):
         factors.append(f)
     factors.extend(_eval_ammo(inputs, thresholds))
+    factors.extend(_eval_effector_supply(inputs, thresholds))
     factors.extend(_eval_wear(inputs, thresholds))
     factors.extend(_eval_inventory(inputs, thresholds))
     if (f := _eval_mtbf(inputs, thresholds)):

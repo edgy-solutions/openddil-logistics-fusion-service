@@ -29,6 +29,7 @@ from confluent_kafka import KafkaException, Producer
 # Generated proto bindings are on PYTHONPATH (set by Dockerfile)
 sys.path.insert(0, str(Path(__file__).parent))
 
+from fusion import effector_supply
 from fusion.ontology_check import check_ontology_consistency
 from fusion.thresholds import Thresholds
 from workflows import asset_logistics
@@ -161,6 +162,17 @@ def main() -> None:
         thresholds.mtbf_hours_critical, thresholds.mtbf_hours_degraded,
         thresholds.emit_interval_seconds, thresholds.stale_input_seconds,
     )
+
+    # Declared-load table (same EFFECTOR_DECLARED_LOAD_PATH file the
+    # projector reads). A malformed file is fatal at startup, same
+    # discipline as the projector's loader for this file — a bad config
+    # surfaces here, not later as a silently-wrong effector factor.
+    try:
+        declared_load_table = effector_supply.load_declared_load()
+    except effector_supply.DeclaredLoadConfigError as exc:
+        logger.error("Fatal: EFFECTOR_DECLARED_LOAD_PATH failed to validate: %s", exc)
+        raise SystemExit(1) from exc
+    asset_logistics.set_declared_load(declared_load_table)
 
     producer = _build_producer()
     _install_kafka_publisher(producer)

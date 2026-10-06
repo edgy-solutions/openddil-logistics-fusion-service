@@ -92,6 +92,15 @@ def _per_edge_subscriptions(edge_id: str) -> list[Subscription]:
             handler="AssetLogistics/on_capability_snapshot",
             consumer_group=f"fusion-service-capability-{edge_id}",
         ),
+        # Fusion gets launch counts from its own subscription to
+        # effector-events (keyed by launcher asset id), mirroring
+        # asset-capability-snapshot above rather than reading the
+        # projector's table.
+        Subscription(
+            topic="effector-events",
+            handler="AssetLogistics/on_effector_event",
+            consumer_group=f"fusion-service-effector-{edge_id}",
+        ),
     ]
 
 

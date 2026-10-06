@@ -18,3 +18,27 @@ removal_unknown_asset_dropped_total = Counter(
     "logistics_removal_unknown_asset_dropped_total",
     "Remove Entity claims for an asset_id with no AssetLogistics state, dropped",
 )
+
+# effector-events (Fire/Detonation) handling, AssetLogistics.on_effector_event.
+# Labeled by reason so "unknown_launcher" (Fire, no prior AssetLogistics
+# state) is distinguishable from any other future refusal reason.
+fusion_effector_refused_total = Counter(
+    "fusion_effector_refused_total",
+    "Fire/Detonation events refused by AssetLogistics.on_effector_event",
+    ["reason"],
+)
+
+# A Fire whose event_urn was already counted -- changes nothing, counted
+# here rather than as a refusal (it is not malformed or unadmitted, it is
+# the same record arriving again).
+fusion_effector_replayed_total = Counter(
+    "fusion_effector_replayed_total",
+    "Fire events whose event_urn was already counted (no state change)",
+)
+
+# Detonation has no supply effect (expended is counted at Fire) and is
+# never refused -- this counts that it was seen, nothing more.
+fusion_effector_detonation_seen_total = Counter(
+    "fusion_effector_detonation_seen_total",
+    "Detonation events observed by AssetLogistics.on_effector_event",
+)

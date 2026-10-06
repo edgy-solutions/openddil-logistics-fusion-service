@@ -24,6 +24,10 @@ Inputs (delivered by Restate Kafka subscriptions):
     - weapons-capability feed (source-specific messages decomposed
       into the canonical shape at ingress); drives the engagement-
       worthiness evaluator (Sub-phase F)
+  on_effector_event(Fire/Detonation-JSON)
+    - source topic: effector-events, keyed by launcher_urn
+    - Fire accumulates expended[munition_key] (deduped by event_urn) and
+      drives the effector-supply evaluator; Detonation is counted only
   on_timer()
     - scheduled callback, fires every EMIT_INTERVAL_SECONDS
 
@@ -36,6 +40,8 @@ Durable state keys per asset:
   latest_windows_dict            — last WindowedTelemetry (as dict)
   cm_state_dict                  — last AsMaintainedConfiguration (as dict)
   latest_capability_dict         — last AssetCapabilitySnapshot (as dict)
+  effector_expended_dict         — Σ quantity fired per munition_key
+  effector_counted_urns_list     — dedup set (ordered list) of counted Fire event_urns
   last_emitted_severity          — int (LogisticsSeverity enum value)
   status_revision                — uint64, increments per emission
   next_timer_ns                  — int, unix ns of the next scheduled on_timer
@@ -57,9 +63,15 @@ from openddil.logistics.v1 import logistics_status_pb2 as ls
 from openddil.logistics.v1 import windowed_telemetry_pb2 as win
 from openddil.telemetry.v1 import telemetry_pb2 as tel
 
+from fusion import effector_supply
 from fusion.rules import FusionInputs, compute_logistics_status
 from fusion.thresholds import Thresholds
-from metrics import removal_unknown_asset_dropped_total
+from metrics import (
+    fusion_effector_detonation_seen_total,
+    fusion_effector_refused_total,
+    fusion_effector_replayed_total,
+    removal_unknown_asset_dropped_total,
+)
 
 logger = logging.getLogger("logistics.asset_logistics")
 
@@ -84,6 +96,26 @@ def _thresholds() -> Thresholds:
             "serving the AssetLogistics object"
         )
     return _THRESHOLDS
+
+
+# Declared-load table (fusion.effector_supply.load_declared_load's return
+# shape): {"asset": {id: {munition_key: declared}}, "variant": {...}}.
+# Defaults to empty so a service that never calls set_declared_load (e.g. a
+# unit test that only exercises other handlers) resolves "nothing declared"
+# rather than raising, matching load_declared_load's own no-file default.
+_DECLARED_LOAD_TABLE: dict = {"asset": {}, "variant": {}}
+
+
+def set_declared_load(table: dict) -> None:
+    """Install the parsed declared-load table. main.py calls this at
+    startup with fusion.effector_supply.load_declared_load()'s result, the
+    same pattern set_thresholds uses."""
+    global _DECLARED_LOAD_TABLE
+    _DECLARED_LOAD_TABLE = table
+
+
+def _declared_load_table() -> dict:
+    return _DECLARED_LOAD_TABLE
 
 
 # Kafka publisher hook (installed by main.py).
@@ -382,6 +414,17 @@ _KEY_CM_STATE = "cm_state_dict"
 # specific producer at ingress). Drives the engagement-worthiness
 # evaluator (`_eval_inventory`).
 _KEY_CAPABILITY = "latest_capability_dict"
+# Effector supply: Σ quantity fired per munition_key, from fusion's own
+# `effector-events` subscription (on_effector_event), never from telemetry
+# or the projector's table. `_KEY_EFFECTOR_COUNTED_URNS` is the dedup set
+# (as an ordered list — Restate state must be JSON-serializable) that
+# `fusion.effector_supply.apply_fire` uses to recognise a replayed Fire.
+# Both keys live on THIS object, so `restate state clear AssetLogistics/
+# <asset_id>` (the existing reset path — see clear_asset_logistics_state in
+# the hero-test helpers) clears them along with every other key here; no
+# separate reset path exists or is needed for either.
+_KEY_EFFECTOR_EXPENDED = "effector_expended_dict"
+_KEY_EFFECTOR_COUNTED_URNS = "effector_counted_urns_list"
 _KEY_LAST_SEVERITY = "last_emitted_severity"
 _KEY_REVISION = "status_revision"
 _KEY_NEXT_TIMER = "next_timer_ns"
@@ -552,6 +595,71 @@ async def on_capability_snapshot(ctx: restate.ObjectContext, raw: bytes) -> None
     await _schedule_next_timer(ctx, asset_id)
 
 
+@asset_logistics.handler(
+    "on_effector_event",
+    accept="*/*",
+    input_serde=restate.serde.BytesSerde(),
+)
+async def on_effector_event(ctx: restate.ObjectContext, raw: bytes) -> None:
+    """Consume a Fire or Detonation record from `effector-events` (keyed by
+    `launcher_urn`, which is this object's key). Registered the same way
+    `on_capability_snapshot` is.
+
+    Fire: admitted the same test as a removal (`_has_known_state`), not a
+    literal check of `_KEY_TELEMETRY` — this topic carries no sustainment
+    either, so a DIS-only launcher admitted solely via Entity State would
+    never populate `_KEY_TELEMETRY` and would read as permanently unknown
+    under a literal check. An admitted Fire adds `quantity` to
+    `expended[munition_key]`, deduped by `event_urn`
+    (`fusion.effector_supply.apply_fire`); a Fire whose urn is already
+    counted changes nothing and is counted as a replay, never a refusal. A
+    counted (non-replay) Fire recomputes and publishes immediately, the
+    same as `on_capability_snapshot`, so status reflects it without waiting
+    for the next telemetry or timer.
+
+    Detonation has no supply effect — expended is counted at Fire — and is
+    never refused; it is only counted as seen."""
+    asset_id = ctx.key()
+    event = _decode_effector_event(raw)
+    if not event:
+        return
+
+    pdu_type = event.get("pdu_type")
+    if pdu_type == "detonation":
+        fusion_effector_detonation_seen_total.inc()
+        return
+    if pdu_type != "fire":
+        return
+
+    if not await _has_known_state(ctx):
+        fusion_effector_refused_total.labels(reason="unknown_launcher").inc()
+        return
+
+    event_urn = event.get("event_urn")
+    if not event_urn:
+        return
+
+    munition_key = effector_supply.munition_type_key(event.get("munition_type"))
+    quantity = int(event.get("quantity", 0) or 0)
+
+    expended = await ctx.get(_KEY_EFFECTOR_EXPENDED, type_hint=dict) or {}
+    counted_urns = await ctx.get(_KEY_EFFECTOR_COUNTED_URNS, type_hint=list) or []
+
+    new_expended, new_counted, was_replay = effector_supply.apply_fire(
+        expended, counted_urns,
+        event_urn=event_urn, munition_key=munition_key, quantity=quantity,
+    )
+    if was_replay:
+        fusion_effector_replayed_total.inc()
+        return
+
+    ctx.set(_KEY_EFFECTOR_EXPENDED, new_expended)
+    ctx.set(_KEY_EFFECTOR_COUNTED_URNS, new_counted)
+    await _refresh_provenance(ctx, event)
+    await _recompute_and_maybe_emit(ctx, asset_id, trigger="effector_event")
+    await _schedule_next_timer(ctx, asset_id)
+
+
 @asset_logistics.handler("on_timer")
 async def on_timer(ctx: restate.ObjectContext, _: dict | None = None) -> None:
     """Scheduled tick. Recompute (some factors are time-dependent — staleness,
@@ -624,6 +732,11 @@ async def _recompute_and_maybe_emit(
     elif windows_proto is not None and windows_proto.platform_variant:
         platform_variant = windows_proto.platform_variant
 
+    effector_expended = await ctx.get(_KEY_EFFECTOR_EXPENDED, type_hint=dict) or {}
+    effector_declared = effector_supply.resolve_declared(
+        _declared_load_table(), asset_id=asset_id, platform_variant=platform_variant,
+    )
+
     inputs = FusionInputs(
         asset_id=asset_id,
         platform_variant=platform_variant,
@@ -631,6 +744,8 @@ async def _recompute_and_maybe_emit(
         telemetry_windows=windows_proto,
         cm_state=cm_proto,
         capability_snapshot=capability_dict or None,
+        effector_expended=effector_expended,
+        effector_declared=effector_declared,
     )
     now_ns = _now_ns(ctx)
     status = compute_logistics_status(inputs, _thresholds(), now_ns)
@@ -915,6 +1030,24 @@ def _decode_capability_snapshot(raw: bytes | dict | None) -> dict:
         return decoded if isinstance(decoded, dict) else {}
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         logger.warning("Failed to decode capability snapshot (len=%d): %s",
+                        len(raw) if raw else 0, exc)
+        return {}
+
+
+def _decode_effector_event(raw: bytes | dict | None) -> dict:
+    """`effector-events` is JSON-only, same contract as
+    `asset-capability-snapshot` — no proto fallback."""
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        text = (raw.decode("utf-8")
+                if isinstance(raw, (bytes, bytearray)) else str(raw))
+        decoded = json.loads(text)
+        return decoded if isinstance(decoded, dict) else {}
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to decode effector event (len=%d): %s",
                         len(raw) if raw else 0, exc)
         return {}
 

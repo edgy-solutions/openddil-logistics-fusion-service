@@ -27,6 +27,7 @@ from fusion.rules import (
     compute_logistics_status,
     _eval_fuel,
     _eval_ammo,
+    _eval_effector_supply,
     _eval_wear,
     _eval_inventory,
     _eval_mtbf,
@@ -328,6 +329,103 @@ def test_ammo_zero_capacity_skips():
         _thr(),
     )
     assert factors == []
+
+
+# ---------------------------------------------------------------------------
+# Effector supply evaluator
+# ---------------------------------------------------------------------------
+_MUNITION_KEY = "2.9.225.2.1.1.0"
+
+
+@pytest.mark.parametrize(
+    "expended,expected_severity,expected_remaining",
+    [
+        (1, None, None),                                  # 3/4 = 75% -> none
+        (3, ls.LOGISTICS_SEVERITY_DEGRADED, 1),             # 1/4 = 25% -> DEGRADED
+        (4, ls.LOGISTICS_SEVERITY_CRITICAL, 0),              # 0/4 = 0%  -> CRITICAL
+        (5, ls.LOGISTICS_SEVERITY_CRITICAL, -1),             # -1/4, clamped pct=0% -> CRITICAL
+    ],
+)
+def test_effector_supply_threshold_bands(expended, expected_severity, expected_remaining):
+    factors = _eval_effector_supply(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None,
+                      effector_expended={_MUNITION_KEY: expended},
+                      effector_declared={_MUNITION_KEY: 4}),
+        _thr(),
+    )
+    if expected_severity is None:
+        assert factors == []
+        return
+    assert len(factors) == 1
+    factor = factors[0]
+    assert factor.factor_id == f"effector.{_MUNITION_KEY}"
+    assert factor.severity == expected_severity
+    # remaining is unclamped in the description even when negative (expended=5 case)
+    assert f"remaining {expected_remaining}/4 (expended {expended})" in factor.description
+    assert factor.current_value.unit == "%"
+
+
+def test_effector_supply_no_declared_load_is_no_factor():
+    """Unknown is not red: a munition_key fired but never declared produces
+    no factor at all, not an UNSPECIFIED/red one."""
+    factors = _eval_effector_supply(
+        FusionInputs(ASSET_ID, VARIANT, None, None, None,
+                      effector_expended={_MUNITION_KEY: 999},
+                      effector_declared={}),
+        _thr(),
+    )
+    assert factors == []
+
+
+def test_effector_supply_asset_key_beats_variant_key():
+    """Lookup precedence lives in `effector_supply.resolve_declared`, not in
+    the evaluator itself -- the evaluator only ever sees the already-resolved
+    `effector_declared` dict the caller built. This exercises the resolver
+    directly."""
+    from fusion import effector_supply
+
+    table = {
+        "asset": {ASSET_ID: {_MUNITION_KEY: 4}},
+        "variant": {VARIANT: {_MUNITION_KEY: 999}},
+    }
+    resolved = effector_supply.resolve_declared(
+        table, asset_id=ASSET_ID, platform_variant=VARIANT,
+    )
+    assert resolved == {_MUNITION_KEY: 4}
+
+
+def test_worst_wins_ammo_degraded_effector_critical_overall_critical():
+    inputs = FusionInputs(
+        ASSET_ID, VARIANT,
+        _telemetry(consumables={"main_gun": (8, 40)},   # 20% -> DEGRADED
+                    sample_time_ns=_now_ns() - 30_000_000_000),
+        _windows(), None,
+        effector_expended={_MUNITION_KEY: 4},
+        effector_declared={_MUNITION_KEY: 4},            # 0% -> CRITICAL
+    )
+    status = compute_logistics_status(inputs, _thr(), _now_ns())
+    assert status.overall_severity == ls.LOGISTICS_SEVERITY_CRITICAL
+    by_id = {f.factor_id: f.severity for f in status.constraining_factors}
+    assert by_id["ammo.main_gun"] == ls.LOGISTICS_SEVERITY_DEGRADED
+    assert by_id[f"effector.{_MUNITION_KEY}"] == ls.LOGISTICS_SEVERITY_CRITICAL
+
+
+def test_worst_wins_ammo_critical_effector_degraded_overall_critical():
+    """Same worst-wins outcome with the severities swapped between the two
+    evaluators, to show the result is not an artifact of evaluation order."""
+    inputs = FusionInputs(
+        ASSET_ID, VARIANT,
+        _telemetry(consumables={"main_gun": (3, 40)},   # 7.5% -> CRITICAL
+                    sample_time_ns=_now_ns() - 30_000_000_000),
+        _windows(), None,
+        effector_expended={_MUNITION_KEY: 3},
+        effector_declared={_MUNITION_KEY: 4},            # 25% -> DEGRADED
+    )
+    status = compute_logistics_status(inputs, _thr(), _now_ns())
+    assert status.overall_severity == ls.LOGISTICS_SEVERITY_CRITICAL
+    by_id = {f.factor_id: f.severity for f in status.constraining_factors}
+    assert by_id["ammo.main_gun"] == ls.LOGISTICS_SEVERITY_CRITICAL
+    assert by_id[f"effector.{_MUNITION_KEY}"] == ls.LOGISTICS_SEVERITY_DEGRADED
 
 
 # ---------------------------------------------------------------------------
