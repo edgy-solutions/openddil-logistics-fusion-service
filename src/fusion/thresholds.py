@@ -55,6 +55,15 @@ class Thresholds:
     # framework-free.
     subsystem_health_map: dict[str, int] = field(default_factory=dict)
 
+    # One writer per asset at EVERY fusion, from record provenance: the ids
+    # of every OTHER node that runs its own fusion stack. This fusion must
+    # not be a second writer for an asset whose origin (see `_KEY_ORIGIN` /
+    # `_refresh_origin`) is one of them — see `workflows.asset_logistics`'s
+    # module docstring and `_recompute_and_maybe_emit` / `_schedule_next_
+    # timer`. Empty means no other stacks exist yet, so this fusion derives
+    # for every asset (today's behaviour).
+    other_stack_ids: frozenset[str] = field(default_factory=frozenset)
+
     @classmethod
     def from_env(cls) -> Thresholds:
         # subsystem_health_map: JSON object string in SUBSYSTEM_HEALTH_MAP env
@@ -98,6 +107,13 @@ class Thresholds:
                     "known LogisticsSeverity; dropping", sev_name, token,
                 )
 
+        # OTHER_STACK_IDS: comma-separated node ids, default empty (same
+        # one-parse-at-config-load discipline as every other field here).
+        other_stack_ids = frozenset(
+            t.strip() for t in os.getenv("OTHER_STACK_IDS", "").split(",")
+            if t.strip()
+        )
+
         return cls(
             fuel_pct_critical    = float(os.getenv("FUEL_PCT_CRITICAL",    "15")),
             fuel_pct_degraded    = float(os.getenv("FUEL_PCT_DEGRADED",    "30")),
@@ -111,4 +127,5 @@ class Thresholds:
             emit_interval_seconds = int(os.getenv("EMIT_INTERVAL_SECONDS",  "30")),
             stale_input_seconds  = int(os.getenv("STALE_INPUT_SECONDS",   "300")),
             subsystem_health_map = sev_map,
+            other_stack_ids      = other_stack_ids,
         )

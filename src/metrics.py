@@ -42,3 +42,18 @@ fusion_effector_detonation_seen_total = Counter(
     "fusion_effector_detonation_seen_total",
     "Detonation events observed by AssetLogistics.on_effector_event",
 )
+
+# One writer per asset at EVERY fusion, from record provenance:
+# `_recompute_and_maybe_emit` / `_schedule_next_timer` suppress this
+# fusion's own publish + timer re-arm for an asset whose origin edge_id
+# (see `_KEY_ORIGIN` / `_refresh_origin`) is an OTHER node's own stack (or
+# not yet known, while OTHER_STACK_IDS is non-empty) -- that node is the
+# writer for that asset, or origin hasn't been decided yet. Counts each
+# suppressed publish, i.e. each recompute that would otherwise have
+# emitted.
+fusion_publish_suppressed_other_stack_total = Counter(
+    "fusion_publish_suppressed_other_stack_total",
+    "Recomputes that would have published but were suppressed because the "
+    "asset's origin is another node's own fusion stack, or its origin is "
+    "not yet known",
+)

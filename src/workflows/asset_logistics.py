@@ -77,6 +77,7 @@ from metrics import (
     fusion_effector_detonation_seen_total,
     fusion_effector_refused_total,
     fusion_effector_replayed_total,
+    fusion_publish_suppressed_other_stack_total,
     removal_unknown_asset_dropped_total,
 )
 
@@ -385,6 +386,10 @@ def _publish_kafka(*, topic: str, key: str, value: bytes) -> None:
 
 
 # Restate state keys
+# One writer per asset, from record provenance: this key's edge_id is also
+# the origin(asset) the guard in `_held_for_other_stack` reads -- no
+# separate key, no registry, no new header. See that function and the
+# module docstring.
 _KEY_ORIGIN = "origin_node"
 # ADR-0029 §3. Held per-asset for the same reason as _KEY_ORIGIN: a derived
 # row emitted on a timer has no inbound event to read labels from, and a
@@ -723,6 +728,40 @@ async def on_timer(ctx: restate.ObjectContext, _: dict | None = None) -> None:
 # ---------------------------------------------------------------------------
 # Core recompute path
 # ---------------------------------------------------------------------------
+async def _held_for_other_stack(ctx: restate.ObjectContext) -> bool:
+    """One writer per asset at EVERY fusion, from record provenance: true
+    when THIS fusion must NOT act (emit, or (re)arm its own timer) for
+    this asset because the asset's own ingest belongs to some OTHER node
+    that runs its own fusion stack.
+
+    origin(asset) is `_KEY_ORIGIN`'s edge_id -- already kept current by
+    `_refresh_origin` for every inbound event (nested provenance.edge_id,
+    or top-level edge_id on cm-state), which runs before this guard is
+    ever evaluated. No registry, no new header, no bridge change.
+
+    False whenever OTHER_STACK_IDS is empty -- no other node has its own
+    stack, so today's behaviour holds and this fusion derives for every
+    asset. Otherwise true when origin is unknown/empty (no input has
+    decided it yet -- HOLD rather than risk being a second writer for
+    the few seconds between a restart and the first input that carries
+    provenance) OR origin is one of OTHER_STACK_IDS (that node's own
+    fusion is the one writer for this asset; what arrived here crossed a
+    bridge and is held, not re-derived).
+
+    Shared by `_recompute_and_maybe_emit` (suppress the publish) and
+    `_schedule_next_timer` (end the timer chain instead of re-arming it),
+    so the two can never disagree about whether this fusion owns the
+    asset. Root and every tier run this same function against their own
+    OTHER_STACK_IDS -- same rule everywhere.
+    """
+    other_stack_ids = _thresholds().other_stack_ids
+    if not other_stack_ids:
+        return False
+    origin = await ctx.get(_KEY_ORIGIN, type_hint=dict) or {}
+    edge_id = origin.get("edge_id") or ""
+    return (not edge_id) or (edge_id in other_stack_ids)
+
+
 async def _recompute_and_maybe_emit(
     ctx: restate.ObjectContext,
     asset_id: str,
@@ -812,6 +851,16 @@ async def _recompute_and_maybe_emit(
 
     if not (is_initial or is_transition or force_emit):
         return  # quiet update, no emission
+
+    # One writer per asset, from record provenance (see
+    # `_held_for_other_stack`): this would otherwise be a publish, so
+    # suppress it here rather than earlier -- a quiet update above already
+    # returns without touching anything, and counting THOSE as suppressed
+    # would overcount a metric meant to answer "how often would this
+    # fusion have been a second writer."
+    if await _held_for_other_stack(ctx):
+        fusion_publish_suppressed_other_stack_total.inc()
+        return  # no publish, no revision/last-severity change
 
     revision = await ctx.get(_KEY_REVISION, type_hint=int) or 0
     revision += 1
@@ -998,7 +1047,18 @@ async def _schedule_next_timer(ctx: restate.ObjectContext, asset_id: str) -> Non
 
     Debounce: if a timer is already scheduled within the cadence window,
     don't double-schedule (avoids piling up timer events for chatty assets).
+
+    One writer per asset, from record provenance (see
+    `_held_for_other_stack`): for an asset whose origin is another node's
+    own stack -- or whose origin isn't decided yet -- the timer chain
+    ENDS here instead of re-arming. Re-arming this fusion's own cadence
+    for an asset it must not derive for is exactly the race that
+    recreates the second writer a few seconds after every restart, just
+    on a longer period.
     """
+    if await _held_for_other_stack(ctx):
+        return  # no timer chain for an asset this fusion does not own
+
     now_ns = _now_ns(ctx)
     cadence_ns = _thresholds().emit_interval_seconds * 1_000_000_000
     target_ns = now_ns + cadence_ns
