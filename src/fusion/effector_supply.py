@@ -193,3 +193,28 @@ def apply_fire(
     if len(new_counted) > MAX_COUNTED_URNS:
         new_counted = new_counted[-MAX_COUNTED_URNS:]
     return new_expended, new_counted, False
+
+
+def apply_resupply(
+    expended: dict[str, int],
+    counted_urns: list[str],
+    *, event_urn: str, supplies: list[dict[str, Any]],
+) -> tuple[dict[str, int], list[str], bool]:
+    """Pure dedup + refill for one Resupply Received. Same contract and
+    same bounded `counted_urns` list as `apply_fire`.
+
+    Each supply lowers `expended[munition_key]` by its quantity, floored at
+    0, so remaining (declared - expended) never exceeds the declared load.
+    A key that was never fired is left as it was (absent stays absent)."""
+    if event_urn in counted_urns:
+        return dict(expended), list(counted_urns), True
+    new_expended = dict(expended)
+    for supply in supplies:
+        key = munition_type_key(supply.get("munition_type"))
+        if key not in new_expended:
+            continue
+        new_expended[key] = max(0, new_expended[key] - int(supply.get("quantity", 0) or 0))
+    new_counted = list(counted_urns) + [event_urn]
+    if len(new_counted) > MAX_COUNTED_URNS:
+        new_counted = new_counted[-MAX_COUNTED_URNS:]
+    return new_expended, new_counted, False

@@ -24,7 +24,7 @@ removal_unknown_asset_dropped_total = Counter(
 # state) is distinguishable from any other future refusal reason.
 fusion_effector_refused_total = Counter(
     "fusion_effector_refused_total",
-    "Fire/Detonation events refused by AssetLogistics.on_effector_event",
+    "Fire/Resupply/Detonation events refused by AssetLogistics.on_effector_event",
     ["reason"],
 )
 
@@ -33,7 +33,7 @@ fusion_effector_refused_total = Counter(
 # the same record arriving again).
 fusion_effector_replayed_total = Counter(
     "fusion_effector_replayed_total",
-    "Fire events whose event_urn was already counted (no state change)",
+    "Fire and resupply events whose event_urn was already counted (no state change)",
 )
 
 # Detonation has no supply effect (expended is counted at Fire) and is

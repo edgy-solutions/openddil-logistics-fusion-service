@@ -24,10 +24,11 @@ Inputs (delivered by Restate Kafka subscriptions):
     - weapons-capability feed (source-specific messages decomposed
       into the canonical shape at ingress); drives the engagement-
       worthiness evaluator (Sub-phase F)
-  on_effector_event(Fire/Detonation-JSON)
+  on_effector_event(Fire/Detonation/Resupply-JSON)
     - source topic: effector-events, keyed by launcher_urn
     - Fire accumulates expended[munition_key] (deduped by event_urn) and
-      drives the effector-supply evaluator; Detonation is counted only
+      drives the effector-supply evaluator; a Resupply Received lowers it
+      (floored at 0); Detonation is counted only
   on_registry_event(asset-registry-events-JSON)
     - source topic: asset-registry-events, keyed by asset_id
     - asset-registry-service's own record of this asset (ADR-0028); the
@@ -620,7 +621,8 @@ async def on_capability_snapshot(ctx: restate.ObjectContext, raw: bytes) -> None
     input_serde=restate.serde.BytesSerde(),
 )
 async def on_effector_event(ctx: restate.ObjectContext, raw: bytes) -> None:
-    """Consume a Fire or Detonation record from `effector-events` (keyed by
+    """Consume a Fire, Resupply Received or Detonation record from
+    `effector-events` (keyed by
     `launcher_urn`, which is this object's key). Registered the same way
     `on_capability_snapshot` is.
 
@@ -636,6 +638,13 @@ async def on_effector_event(ctx: restate.ObjectContext, raw: bytes) -> None:
     same as `on_capability_snapshot`, so status reflects it without waiting
     for the next telemetry or timer.
 
+    Resupply Received: same admission and refusal as Fire. Each supply
+    lowers `expended[munition_key]`, floored at 0, so remaining never rises
+    above the declared load (`apply_resupply`); it shares Fire's dedup list
+    and, when counted, recomputes and publishes the same way. Events for one
+    launcher arrive in order (the topic is keyed by launcher_urn), so a
+    refill lands between the Fires it sits between.
+
     Detonation has no supply effect — expended is counted at Fire — and is
     never refused; it is only counted as seen."""
     asset_id = ctx.key()
@@ -647,7 +656,7 @@ async def on_effector_event(ctx: restate.ObjectContext, raw: bytes) -> None:
     if pdu_type == "detonation":
         fusion_effector_detonation_seen_total.inc()
         return
-    if pdu_type != "fire":
+    if pdu_type not in ("fire", "resupply_received"):
         return
 
     if not await _has_known_state(ctx):
@@ -658,16 +667,21 @@ async def on_effector_event(ctx: restate.ObjectContext, raw: bytes) -> None:
     if not event_urn:
         return
 
-    munition_key = effector_supply.munition_type_key(event.get("munition_type"))
-    quantity = int(event.get("quantity", 0) or 0)
-
     expended = await ctx.get(_KEY_EFFECTOR_EXPENDED, type_hint=dict) or {}
     counted_urns = await ctx.get(_KEY_EFFECTOR_COUNTED_URNS, type_hint=list) or []
 
-    new_expended, new_counted, was_replay = effector_supply.apply_fire(
-        expended, counted_urns,
-        event_urn=event_urn, munition_key=munition_key, quantity=quantity,
-    )
+    if pdu_type == "resupply_received":
+        new_expended, new_counted, was_replay = effector_supply.apply_resupply(
+            expended, counted_urns,
+            event_urn=event_urn, supplies=event.get("supplies") or [],
+        )
+    else:
+        munition_key = effector_supply.munition_type_key(event.get("munition_type"))
+        quantity = int(event.get("quantity", 0) or 0)
+        new_expended, new_counted, was_replay = effector_supply.apply_fire(
+            expended, counted_urns,
+            event_urn=event_urn, munition_key=munition_key, quantity=quantity,
+        )
     if was_replay:
         fusion_effector_replayed_total.inc()
         return

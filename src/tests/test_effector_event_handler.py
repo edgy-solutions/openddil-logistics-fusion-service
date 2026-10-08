@@ -206,3 +206,50 @@ def test_detonation_never_refused_no_supply_effect():
 
     assert ctx._state == {}, "detonation never writes state"
     assert _counter(fusion_effector_detonation_seen_total) == before + 1
+
+
+# ---------------------------------------------------------------------------
+# Resupply Received
+# ---------------------------------------------------------------------------
+def _resupply_record(*, event_urn: str, quantity: int) -> dict:
+    return {
+        "pdu_type": "resupply_received",
+        "event_urn": event_urn,
+        "launcher_urn": "dis:1:1:5001",
+        "supplier_urn": "dis:1:1:7001",
+        "supplies": [{"munition_type": _fire_record(event_urn="x")["munition_type"],
+                      "quantity": quantity}],
+        "ingest_timestamp": "2026-10-06T12:00:00Z",
+        "provenance": {"edge_id": "edge-01", "region_id": "region-east"},
+    }
+
+
+def test_unknown_launcher_resupply_is_refused():
+    ctx = StubCtx(key="dis:1:1:5001", now_ns=_now_ns())
+    before = _counter(fusion_effector_refused_total, reason="unknown_launcher")
+
+    asyncio.run(on_effector_event(ctx, _resupply_record(event_urn="dis-resupply:1:1:5001:1", quantity=2)))
+
+    assert ctx._state == {}
+    assert ctx.scheduled == []
+    assert _counter(fusion_effector_refused_total, reason="unknown_launcher") == before + 1
+
+
+def test_resupply_lowers_expended_and_replay_is_noop():
+    asset_id = "dis:1:1:5001"
+    ctx = StubCtx(key=asset_id, now_ns=_now_ns())
+    asyncio.run(on_proprietary_update(ctx, _telemetry_record(asset_id)))
+    asyncio.run(on_effector_event(ctx, _fire_record(event_urn="dis-event:1:1:1", quantity=3)))
+    scheduled_before = len(ctx.scheduled)
+    ctx._now_ns += (Thresholds().emit_interval_seconds + 5) * 1_000_000_000
+
+    resupply = _resupply_record(event_urn="dis-resupply:1:1:5001:9", quantity=2)
+    asyncio.run(on_effector_event(ctx, resupply))
+
+    assert ctx._state["effector_expended_dict"] == {_MUNITION_KEY: 1}
+    assert len(ctx.scheduled) > scheduled_before
+
+    before = _counter(fusion_effector_replayed_total)
+    asyncio.run(on_effector_event(ctx, resupply))
+    assert ctx._state["effector_expended_dict"] == {_MUNITION_KEY: 1}
+    assert _counter(fusion_effector_replayed_total) == before + 1
