@@ -64,7 +64,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import restate
-from google.protobuf.json_format import MessageToDict, Parse
+from google.protobuf.json_format import MessageToDict, Parse, ParseDict, ParseError
 
 from openddil.configuration.v1 import as_maintained_pb2 as cm
 from openddil.logistics.v1 import logistics_status_pb2 as ls
@@ -233,6 +233,41 @@ def _apply_operational_axes(telemetry_proto, axes: dict) -> None:
         setattr(op, axis, enum_value.number)
 
 
+# Sources whose condition value failed to parse, so a persistently malformed
+# producer warns once rather than on every recompute.
+_condition_parse_warned: set[str] = set()
+
+
+def _apply_condition(telemetry_proto, entry: dict | None) -> None:
+    """Write the remembered condition onto the telemetry the rules will read.
+
+    Only a condition a source actually SENT is written; a value this build
+    cannot parse leaves the field unset rather than guessing at a claim.
+    """
+    value = (entry or {}).get("value")
+    if not value:
+        return
+    cond = telemetry_proto.operational_state.condition
+    cond.Clear()
+    try:
+        ParseDict(value, cond, ignore_unknown_fields=True)
+        # Unknown-field tolerance also swallows an enum name this build does
+        # not know, leaving it UNSPECIFIED. A claim that said something and
+        # came out saying nothing is a failed parse, not an absent claim.
+        for sent, got in zip(value.get("claims") or [], cond.claims):
+            for key, parsed in (("source", got.source), ("level", got.level)):
+                said = sent.get(key) if isinstance(sent, dict) else None
+                if said and not parsed and "UNSPECIFIED" not in str(said):
+                    raise ParseError(f"unknown {key} {said!r}")
+    except ParseError as exc:
+        cond.Clear()
+        source = str((entry or {}).get("source") or "unknown")
+        if source not in _condition_parse_warned:
+            _condition_parse_warned.add(source)
+            logger.warning("operational condition from %s did not parse (%s); "
+                           "leaving the condition unset", source, exc)
+
+
 # The sustainment sub-messages an evaluator can actually USE. `health` is
 # excluded on purpose: a DIS record carries `sustainment.health` (an empty
 # submessage) and nothing else, and the wear/fuel/ammo evaluators read none
@@ -339,6 +374,19 @@ async def _absorb_operational_state(ctx, record_dict: dict | None) -> None:
     source = prov.get("sourceProtocol") or prov.get("source_protocol") or "unknown"
     sample_time = (record_dict or {}).get("sampleTime") or                   (record_dict or {}).get("sample_time") or ""
 
+    # The condition is remembered whole, under its own key, last writer wins.
+    # A source that stops sending one clears only its own earlier claim; a
+    # different source's silence on condition is not a claim to keep or drop.
+    condition = op.get("condition")
+    stored = await ctx.get(_KEY_CONDITION, type_hint=dict)
+    if condition:
+        entry = {"value": condition, "source": source,
+                 "sample_time": str(sample_time)}
+        if entry != stored:
+            ctx.set(_KEY_CONDITION, entry)
+    elif stored and stored.get("source") == source:
+        ctx.clear(_KEY_CONDITION)
+
     current = (await ctx.get(_KEY_OPERATIONAL_STATE, type_hint=dict)) or {}
     changed = False
     for axis in _OPERATIONAL_AXES:
@@ -420,6 +468,7 @@ _KEY_DERIVED_TELEMETRY = "latest_derived_telemetry_dict"
 # another feed says NOMINAL, minutes apart) DETECTABLE later. The detector is
 # not built — the stamps only make it possible.
 _KEY_OPERATIONAL_STATE = "operational_state_axes"
+_KEY_CONDITION = "operational_condition"
 _KEY_WINDOWS = "latest_windows_dict"
 _KEY_CM_STATE = "cm_state_dict"
 # Sub-phase F: latest weapons-capability snapshot for this asset
@@ -453,7 +502,7 @@ _KEY_NEXT_TIMER = "next_timer_ns"
 # — see the comment above `_is_removal` for why these five and not fewer.
 _KNOWN_ASSET_KEYS = (
     _KEY_LAST_SEVERITY, _KEY_TELEMETRY, _KEY_DERIVED_TELEMETRY,
-    _KEY_OPERATIONAL_STATE, _KEY_CM_STATE,
+    _KEY_OPERATIONAL_STATE, _KEY_CONDITION, _KEY_CM_STATE,
 )
 
 
@@ -791,6 +840,7 @@ async def _recompute_and_maybe_emit(
     capability_dict = await ctx.get(_KEY_CAPABILITY, type_hint=dict)
 
     operational_axes = await ctx.get(_KEY_OPERATIONAL_STATE, type_hint=dict)
+    operational_condition = await ctx.get(_KEY_CONDITION, type_hint=dict)
 
     # Phase 5 merge rule: measured wins, derived fills the DIS-asset gap.
     # `_KEY_TELEMETRY` now admits by CONTENT (carries sustainment) rather
@@ -822,8 +872,12 @@ async def _recompute_and_maybe_emit(
     # fault reached the read model (the projector writes it from the same
     # Silver message) and never reached severity — three signals said the
     # path was live and it was not.
+    # (A DIS-only asset with no derived record has no telemetry_proto, so it
+    # gets neither axes nor condition here.)
     if telemetry_proto is not None and operational_axes:
         _apply_operational_axes(telemetry_proto, operational_axes)
+    if telemetry_proto is not None and operational_condition:
+        _apply_condition(telemetry_proto, operational_condition)
     windows_proto = _dict_to_windows(windows_dict) if windows_dict else None
     cm_proto = _dict_to_cm_state(cm_dict) if cm_dict else None
 
