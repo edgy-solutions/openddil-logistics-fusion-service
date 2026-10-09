@@ -724,6 +724,60 @@ def _eval_subsystems(inputs: FusionInputs,
     return factors
 
 
+# Worst-first order used only to pick between two claims from the same
+# source. Mirrors level_order in the contracts ontology file
+# dis_condition.yaml (NOMINAL last, and never a factor).
+_CONDITION_LEVEL_ORDER = (
+    "DESTROYED", "DEACTIVATED", "SENSOR_FAILED", "NOT_EMITTING",
+    "CRITICAL", "DEGRADED",
+)
+
+
+def _eval_condition_claims(
+        condition: tel.Condition) -> list[ls.ConstrainingFactor]:
+    """One ConstrainingFactor per source that claims a non-nominal level."""
+    best: dict[int, tuple[int, str, "tel.ConditionClaim"]] = {}
+    for claim in condition.claims:
+        if claim.source == tel.CONDITION_SOURCE_UNSPECIFIED:
+            continue
+        if claim.level in (tel.CONDITION_LEVEL_UNSPECIFIED,
+                           tel.CONDITION_LEVEL_NOMINAL):
+            continue
+        try:
+            short = tel.ConditionLevel.Name(claim.level).removeprefix(
+                "CONDITION_LEVEL_")
+        except ValueError:
+            short = ""
+        if short not in _CONDITION_LEVEL_ORDER:
+            # Same reasoning as the subsystem evaluator: a silent discard
+            # is indistinguishable from a producer that said nothing.
+            _warn_unmapped_once(
+                "condition level", short or str(claim.level),
+                "The producer sent a condition level this build does not "
+                "map; regenerate the contracts or extend "
+                "_CONDITION_LEVEL_ORDER.",
+            )
+            continue
+        rank = _CONDITION_LEVEL_ORDER.index(short)
+        cur = best.get(claim.source)
+        if cur is None or rank < cur[0]:
+            best[claim.source] = (rank, short, claim)
+
+    factors: list[ls.ConstrainingFactor] = []
+    for source, (_, short, claim) in best.items():
+        src = tel.ConditionSource.Name(source).removeprefix(
+            "CONDITION_SOURCE_").lower()
+        sev = (ls.LOGISTICS_SEVERITY_DEGRADED if short == "DEGRADED"
+               else ls.LOGISTICS_SEVERITY_CRITICAL)
+        desc = f"{short.replace('_', ' ').capitalize()} per {src.replace('_', ' ')}"
+        if claim.detail:
+            desc += f": {claim.detail}"
+        factors.append(ls.ConstrainingFactor(
+            factor_id=f"condition.{src}", severity=sev, description=desc,
+        ))
+    return factors
+
+
 def _eval_operational_state(inputs: FusionInputs,
                               thresholds: Thresholds) -> list[ls.ConstrainingFactor]:
     """Map OperationalState's 3 axes -> ConstrainingFactor entries.
@@ -743,7 +797,13 @@ def _eval_operational_state(inputs: FusionInputs,
       health_state == FAILED      -> CRITICAL, factor_id="operational.failed"
       health_state == FAULT       -> CRITICAL, factor_id="operational.fault"
       health_state == DEGRADED    -> DEGRADED, factor_id="operational.degraded"
+      condition claim DEGRADED    -> DEGRADED, factor_id="condition.<source>"
+      condition claim, any worse  -> CRITICAL, factor_id="condition.<source>"
       otherwise                   -> no factor (healthy posture)
+
+    The condition rows carry provenance: which source (appearance_damage,
+    appearance_power, emission, data_health) is making the claim. They sit
+    alongside the axis rows, not instead of them.
 
     Multiple axes can each contribute a factor (e.g. an entity reporting
     POWER_STATE_MAINTENANCE + HEALTH_STATE_DEGRADED gets both factors).
@@ -796,6 +856,14 @@ def _eval_operational_state(inputs: FusionInputs,
             severity=ls.LOGISTICS_SEVERITY_DEGRADED,
             description="Entity has a non-critical anomaly limiting capability",
         ))
+
+    # ---- Condition claims (one factor per non-nominal source) ----
+    # Deliberately alongside the axes above, not instead of them: appearance
+    # damage also drives health_state through the mapping, so SLIGHT damage
+    # yields both operational.degraded (the posture) and
+    # condition.appearance_damage (the provenance).
+    if op.HasField("condition"):
+        factors.extend(_eval_condition_claims(op.condition))
 
     # FunctionalMode is informational only — it does NOT drive severity by
     # itself (IDLE vs ACTIVE vs RECEIVE_ONLY are operator postures, not

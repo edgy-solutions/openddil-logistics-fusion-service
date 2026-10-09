@@ -13,6 +13,7 @@ import logging
 import time
 
 import pytest
+from google.protobuf import json_format
 
 from fusion import rules
 
@@ -778,6 +779,7 @@ def _op_state_telemetry(
     functional_mode: int | None = None,
     actively_receiving: bool | None = None,
     actively_transmitting: bool | None = None,
+    condition: dict | None = None,
 ) -> tel.EntityTelemetryEvent:
     """Helper: build an EntityTelemetryEvent with operational_state populated.
     Fields default to the proto's UNSPECIFIED (= 0) when omitted."""
@@ -794,6 +796,8 @@ def _op_state_telemetry(
         evt.operational_state.actively_receiving = actively_receiving
     if actively_transmitting is not None:
         evt.operational_state.actively_transmitting = actively_transmitting
+    if condition is not None:
+        json_format.ParseDict(condition, evt.operational_state.condition)
     return evt
 
 
@@ -1009,6 +1013,93 @@ def test_compute_status_picks_up_operational_state_factor():
     assert status.overall_severity == ls.LOGISTICS_SEVERITY_DEGRADED
     factor_ids = {f.factor_id for f in status.constraining_factors}
     assert "operational.maintenance" in factor_ids
+
+
+# -- Condition claims: one factor per non-nominal source --------------------
+
+def _claim(source: str, level: str, detail: str = "") -> dict:
+    c = {"source": f"CONDITION_SOURCE_{source}",
+         "level": f"CONDITION_LEVEL_{level}"}
+    if detail:
+        c["detail"] = detail
+    return c
+
+
+def _cond_factors(*claims: dict) -> list:
+    evt = _op_state_telemetry(condition={"claims": list(claims)})
+    return [f for f in _eval_operational_state(_op_inputs(evt), _thr())
+            if f.factor_id.startswith("condition.")]
+
+
+def test_condition_absent_no_condition_factor():
+    factors = _eval_operational_state(
+        _op_inputs(_op_state_telemetry(power_state=tel.POWER_STATE_ON)), _thr())
+    assert not [f for f in factors if f.factor_id.startswith("condition.")]
+
+
+@pytest.mark.parametrize("level", [
+    "CRITICAL", "NOT_EMITTING", "SENSOR_FAILED", "DEACTIVATED", "DESTROYED",
+])
+def test_condition_worse_levels_are_critical(level):
+    (f,) = _cond_factors(_claim("EMISSION", level))
+    assert f.severity == ls.LOGISTICS_SEVERITY_CRITICAL
+
+
+def test_condition_degraded_is_degraded():
+    (f,) = _cond_factors(_claim("DATA_HEALTH", "DEGRADED"))
+    assert f.severity == ls.LOGISTICS_SEVERITY_DEGRADED
+
+
+def test_condition_nominal_claim_no_factor():
+    assert _cond_factors(_claim("EMISSION", "NOMINAL")) == []
+
+
+def test_condition_factor_id_per_source():
+    factors = _cond_factors(
+        _claim("APPEARANCE_DAMAGE", "DESTROYED"),
+        _claim("APPEARANCE_POWER", "DEACTIVATED"),
+        _claim("EMISSION", "SENSOR_FAILED"),
+        _claim("DATA_HEALTH", "DEGRADED"),
+    )
+    assert sorted(f.factor_id for f in factors) == [
+        "condition.appearance_damage", "condition.appearance_power",
+        "condition.data_health", "condition.emission",
+    ]
+
+
+def test_condition_same_source_keeps_worse_claim():
+    (f,) = _cond_factors(_claim("EMISSION", "DEGRADED"),
+                         _claim("EMISSION", "SENSOR_FAILED"))
+    assert f.severity == ls.LOGISTICS_SEVERITY_CRITICAL
+
+
+def test_condition_description_with_and_without_detail():
+    (f,) = _cond_factors(_claim("EMISSION", "SENSOR_FAILED", "silent 17 s"))
+    assert f.description == "Sensor failed per emission: silent 17 s"
+    (f,) = _cond_factors(_claim("APPEARANCE_DAMAGE", "DESTROYED"))
+    assert f.description == "Destroyed per appearance damage"
+
+
+def test_condition_slight_damage_gives_axis_and_condition_factor():
+    evt = _op_state_telemetry(
+        health_state=tel.HEALTH_STATE_DEGRADED,
+        condition={"level": "CONDITION_LEVEL_DEGRADED",
+                   "movedBy": ["CONDITION_SOURCE_APPEARANCE_DAMAGE"],
+                   "claims": [_claim("APPEARANCE_DAMAGE", "DEGRADED")]},
+    )
+    ids = {f.factor_id for f in _eval_operational_state(_op_inputs(evt), _thr())}
+    assert {"operational.degraded", "condition.appearance_damage"} <= ids
+
+
+def test_condition_sensor_failed_on_healthy_asset_is_overall_critical():
+    evt = _op_state_telemetry(
+        power_state=tel.POWER_STATE_ON, health_state=tel.HEALTH_STATE_NOMINAL,
+        condition={"claims": [_claim("EMISSION", "SENSOR_FAILED")]},
+    )
+    status = compute_logistics_status(_op_inputs(evt), _thr(), _now_ns())
+    assert status.overall_severity == ls.LOGISTICS_SEVERITY_CRITICAL
+    assert "condition.emission" in {
+        f.factor_id for f in status.constraining_factors}
 
 
 # ---------------------------------------------------------------------------
