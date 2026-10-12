@@ -785,7 +785,7 @@ def _eval_operational_state(inputs: FusionInputs,
     OperationalState is a generic 3-axis posture model (power × mode ×
     health, plus discrete RX/TX cues) populated by any source that carries
     entity operational state — proprietary sensor feeds, DIS EmissionSystem
-    + EntityState appearance, AFSim sensor/platform state, VRForces damage
+    + EntityState appearance, AFSim sensor/platform state, co-located simulator damage
     states, etc. See openddil.telemetry.v1.OperationalState for the proto.
 
     Severity mapping per axis (this evaluator is the policy embodiment of
