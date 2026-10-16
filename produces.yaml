@@ -1,0 +1,10 @@
+# produces.yaml -- every Kafka topic this repo's workloads can write, as templates over the workload's environment.
+# Checked against the code by src/tests/test_produces_manifest.py and against the chart by
+# openddil-helm scripts/check-produces-declarations.py.
+workloads:
+  # The hub and the per-tier copies run the same code and write the same topics.
+  fusion:
+    image: openddil/logistics-fusion-service
+    topics:
+      - asset-logistics-status
+      - tactical-events
