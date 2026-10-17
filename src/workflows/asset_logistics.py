@@ -987,11 +987,11 @@ async def _recompute_and_maybe_emit(
     # and writes to the tactical_events table; ElectricSQL streams
     # the row to the frontend, where AlertFeed renders cross-asset
     # rows with a chevron + click-to-switch affordance. Only fires
-    # on the UPWARD transition into the alerting tiers -- a recovery
-    # transition out of CRITICAL doesn't need an alert (the posture
-    # pill and 3D tiles already reflect it). Initial emissions don't
-    # fire either; only confirmed transitions from a lower severity.
-    if is_transition and status.overall_severity in _ALERTING_SEVERITIES:
+    # on an upward rank change into an alerting tier; a downward move
+    # such as NON_OPERATIONAL -> CRITICAL, and every recovery, is visible
+    # on the status row, not the feed. Initial emissions don't fire
+    # either (prev_sev is None for those).
+    if _is_alerting_transition(prev_sev, status.overall_severity):
         await _publish_tactical_event(
             ctx,
             asset_id=asset_id,
@@ -1018,14 +1018,36 @@ async def _recompute_and_maybe_emit(
     )
 
 
-# Severity tiers that warrant a maintainer-facing tactical event. Tracking
-# only the upward transitions (OK/UNSPECIFIED/DEGRADED -> CRITICAL or
-# NON_OPERATIONAL); recovery transitions are visible through the existing
-# asset-logistics-status path without needing an alert row.
+# Severity tiers that warrant a maintainer-facing tactical event: an upward
+# rank change into an alerting tier; a downward move such as
+# NON_OPERATIONAL -> CRITICAL, and every recovery, is visible on the status
+# row, not the feed.
 _ALERTING_SEVERITIES = frozenset({
     ls.LOGISTICS_SEVERITY_CRITICAL,
     ls.LOGISTICS_SEVERITY_NON_OPERATIONAL,
 })
+
+
+def _is_alerting_transition(prev: int | None, new: int) -> bool:
+    """True only for an upward rank change into an alerting tier.
+
+    The enum is ordered UNSPECIFIED 0 < OK 1 < DEGRADED 2 < CRITICAL 3 <
+    NON_OPERATIONAL 4, so `new > prev` is "worse than before". `prev` None
+    means an initial emission, which never alerts.
+    """
+    return prev is not None and new in _ALERTING_SEVERITIES and new > prev
+
+
+def _top_factor(factors) -> tuple[str, str]:
+    """(factor_id, description) of the highest-severity factor; ties go to
+    the earliest factor. ("", "") when there are none."""
+    best = None
+    for f in factors:
+        if best is None or f.severity > best.severity:
+            best = f
+    if best is None:
+        return ("", "")
+    return (best.factor_id, best.description)
 
 
 async def _publish_tactical_event(
@@ -1049,11 +1071,11 @@ async def _publish_tactical_event(
     the handler reads them via resolve_provenance_from_top_level for
     per-asset row attribution. `originator_nation` /
     `releasable_to` ride in `data` beside them, from this object's own
-    state -- the alert must not be visible to anyone the asset is not. Top constraining factor (if any) lands
-    in the description-ish slot so the AlertFeed row reads as
-    "logistics.transition --- thermal_overload_imminent" rather than
-    just "logistics.transition" with the operator wondering what
-    transitioned why.
+    state -- the alert must not be visible to anyone the asset is not. The
+    highest-severity constraining factor (earliest on ties) rides in
+    `data.top_factor` (its factor_id) and `data.top_factor_description`
+    (its description, cut to 160 chars) so the AlertFeed row can say what
+    caused the transition.
 
     The publish is wrapped in ctx.run so Restate journals it -- a
     crash mid-publish replays into the same idempotent write. uuid4
@@ -1061,12 +1083,7 @@ async def _publish_tactical_event(
     """
     event_id = str(uuid.uuid4())
     event_time = datetime.now(timezone.utc).isoformat()
-    top_factor = ""
-    if constraining_factors:
-        # Best-effort -- the proto has factor.code / factor.detail. Pick
-        # the first; severity-ordering already happened upstream.
-        f = constraining_factors[0]
-        top_factor = getattr(f, "code", "") or getattr(f, "factor_code", "") or ""
+    top_factor, top_description = _top_factor(constraining_factors)
 
     sev_name = _sev_name(new_severity)
     prev_sev_name = _sev_name(prev_severity)
@@ -1084,6 +1101,7 @@ async def _publish_tactical_event(
             "previous_severity": prev_sev_name,
             "status_revision": revision,
             "top_factor": top_factor,
+            "top_factor_description": top_description[:160],
             "edge_id": origin.get("edge_id", ""),
             "region_id": origin.get("region_id", ""),
             # ADR-0029 §3. A tactical event is ABOUT an asset, so it is as
