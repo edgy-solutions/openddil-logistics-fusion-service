@@ -30,6 +30,7 @@ from google.protobuf import timestamp_pb2
 from pint import UnitRegistry, Quantity as PQ
 
 from openddil.common.v1 import quantity_pb2 as qpb
+from openddil.common.v1.ucum import UCUM_TO_PINT as _UCUM_TO_PINT
 from openddil.logistics.v1 import logistics_status_pb2 as ls
 from openddil.telemetry.v1 import telemetry_pb2 as tel
 from openddil.logistics.v1 import windowed_telemetry_pb2 as win
@@ -40,16 +41,10 @@ from fusion.thresholds import Thresholds
 
 logger = logging.getLogger("fusion.rules")
 
-# Single pint registry. UCUM-to-pint dialect shims kept in sync with
-# openddil-tactical-agents/edge/detection/units.py.
+# Single pint registry. The UCUM-to-pint dialect is the shared table in the
+# contract bindings (openddil.common.v1.ucum); add units there, not here.
 ureg = UnitRegistry()
 ureg.default_format = "~"
-_UCUM_TO_PINT = {
-    "[degF]": "degF",
-    "[kn_i]": "knot",
-    "gal_us": "gallon",
-    "1": "dimensionless",
-}
 
 
 # ---------------------------------------------------------------------------
