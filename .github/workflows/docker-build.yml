@@ -19,6 +19,8 @@ permissions:
 # container and the logistics-fusion-bootstrap one-shot (same image, different
 # entrypoint). `${{ github.repository_owner }}` resolves to `edgy-solutions`
 # once the repo is hosted under that org.
+# A pull request builds the image and publishes nothing: :latest moves only on
+# a push to master, so an unmerged branch never reaches a cluster that pulls it.
 
 jobs:
   build-logistics-fusion-service:
@@ -54,5 +56,5 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.tags.outputs.tags }}
