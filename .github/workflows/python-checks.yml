@@ -118,10 +118,7 @@ jobs:
           echo "protobuf runtime installed by the service: $PB"
           pip install "grpcio-tools" "protobuf==$PB"
           cd openddil-contracts
-          mkdir -p gen/python
-          python -m grpc_tools.protoc \
-            --proto_path=proto --python_out=gen/python \
-            $(find proto -name '*.proto')
+          make python PROTOC="python -m grpc_tools.protoc"
           n=$(find gen/python -name '*_pb2.py' | wc -l)
           echo "generated $n protobuf modules"
           if [ "$n" -lt 1 ]; then
