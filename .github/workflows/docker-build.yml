@@ -3,9 +3,8 @@ name: Docker Build
 on:
   push:
     branches: [ "master" ]
-    # Tag pushes (v1.0.0, ...) publish a versioned image (:v1.0.0)
-    # alongside :latest so consumers can pin to a release.
-    tags: [ "v*" ]
+    # Version tags don't build here. A release adds the version tag to an
+    # image already built (see release.yml) and never moves :latest.
   pull_request:
     branches: [ "master" ]
   workflow_dispatch:
