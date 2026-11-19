@@ -5,7 +5,8 @@
 #   built from the tagged commit, and fails if any of them has no such build.
 # - An `<image>/vX.Y.Z[-rcN]` tag retags that one image.
 # - A dispatch run is a dry run by default: it resolves and prints the plan,
-#   tags nothing and creates no release. Run it from the tag's ref.
+#   tags nothing and creates no release. From a branch it can only be a dry
+#   run; `commit` names the commit whose builds it resolves.
 # - The build workflow keeps pushing sha-* / latest on its own. A release never
 #   rebuilds and never moves latest.
 name: release
@@ -16,6 +17,7 @@ on:
     inputs:
       expected: {description: 'image=sha256:… lines', required: false, default: ''}
       dry_run: {type: boolean, default: true}
+      commit: {description: 'dry run only: resolve the builds of this commit', required: false, default: ''}
 permissions:
   contents: write
   packages: write
@@ -26,3 +28,4 @@ jobs:
       images: "logistics-fusion-service"
       expected: ${{ inputs.expected || '' }}
       dry_run: ${{ inputs.dry_run || false }}
+      commit: ${{ inputs.commit || '' }}
