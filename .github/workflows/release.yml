@@ -1,0 +1,28 @@
+# This repo's release caller. The scripts come from openddil-helm's reusable
+# `release-retag.yml`.
+#
+# - A plain tag (vX.Y.Z or vX.Y.Z-rcN) retags every image listed below that was
+#   built from the tagged commit, and fails if any of them has no such build.
+# - An `<image>/vX.Y.Z[-rcN]` tag retags that one image.
+# - A dispatch run is a dry run by default: it resolves and prints the plan,
+#   tags nothing and creates no release. Run it from the tag's ref.
+# - The build workflow keeps pushing sha-* / latest on its own. A release never
+#   rebuilds and never moves latest.
+name: release
+on:
+  push:
+    tags: ['v*', '*/v*']
+  workflow_dispatch:
+    inputs:
+      expected: {description: 'image=sha256:… lines', required: false, default: ''}
+      dry_run: {type: boolean, default: true}
+permissions:
+  contents: write
+  packages: write
+jobs:
+  retag:
+    uses: edgy-solutions/openddil-helm/.github/workflows/release-retag.yml@master
+    with:
+      images: "logistics-fusion-service"
+      expected: ${{ inputs.expected || '' }}
+      dry_run: ${{ inputs.dry_run || false }}
