@@ -25,6 +25,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
@@ -36,15 +38,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Always publish :latest. On a v* tag push, ALSO publish the
-      # tag-versioned image so consumers can pin to a release.
+      # :sha-<7> always, :pr-<N> on a pull request, :<tag> on a v* tag;
+      # :latest only from master.
       - name: Compute image tags
         id: tags
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           REG=ghcr.io/${{ github.repository_owner }}/openddil/logistics-fusion-service
-          T="$REG:latest"
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            T="$T,$REG:${{ github.ref_name }}"
+          T="$REG:sha-${HEAD_SHA:0:7}"
+          if [ -n "$PR_NUMBER" ]; then
+            T="$T,$REG:pr-$PR_NUMBER"
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            T="$T,$REG:$GITHUB_REF_NAME"
+          fi
+          if [ "$GITHUB_REF" = "refs/heads/master" ] && [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            T="$T,$REG:latest"
           fi
           echo "tags=$T" >> "$GITHUB_OUTPUT"
 
@@ -53,5 +64,5 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          push: true
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.tags.outputs.tags }}
